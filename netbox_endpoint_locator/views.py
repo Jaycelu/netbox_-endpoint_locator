@@ -1,3 +1,5 @@
+import json
+
 from django.shortcuts import render
 from django.views.generic import View
 from dcim.models import Device
@@ -26,7 +28,11 @@ class EndpointLookupView(View):
         if not hostname:
             return None
 
-        ip_obj = IPAddress.objects.filter(address__startswith=f"{hostname}/").first()
+        mgmt_ip = str(hostname).strip()
+        if "/" in mgmt_ip:
+            ip_obj = IPAddress.objects.filter(address=mgmt_ip).first()
+        else:
+            ip_obj = IPAddress.objects.filter(address__startswith=f"{mgmt_ip}/").first()
         if not ip_obj:
             return None
 
@@ -52,7 +58,15 @@ class EndpointLookupView(View):
             "vlan": best.get("vlan_id") or best.get("vlan") or "",
             "netbox_device": netbox_device,
             "raw": best,
+            "raw_pretty": self._pretty_json(best),
         }
+
+    @staticmethod
+    def _pretty_json(obj) -> str:
+        try:
+            return json.dumps(obj, ensure_ascii=False, indent=2)
+        except TypeError:
+            return str(obj)
 
     def get(self, request):
         form = EndpointLookupForm(request.GET or None)

@@ -1,21 +1,30 @@
 import ipaddress
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
 
 import requests
 from django.conf import settings
 
-PLUGIN_CFG = settings.PLUGINS_CONFIG.get("netbox_endpoint_locator", {})
+PLUGIN_SLUG = "netbox_endpoint_locator"
 
-LIBRENMS_URL = PLUGIN_CFG["librenms_url"].rstrip("/")
-LIBRENMS_TOKEN = PLUGIN_CFG["librenms_token"]
-VERIFY_SSL = PLUGIN_CFG.get("verify_ssl", False)
-TIMEOUT = PLUGIN_CFG.get("timeout", 15)
 
-HEADERS = {
-    "X-Auth-Token": LIBRENMS_TOKEN,
-    "Accept": "application/json",
-}
+def _get_plugin_cfg() -> Dict[str, Any]:
+    """
+    Return plugin config from NetBox settings.
+
+    IMPORTANT: Do not access required keys at import-time; NetBox imports plugins
+    early, and missing config should fail gracefully at request time.
+    """
+
+    cfg = (settings.PLUGINS_CONFIG or {}).get(PLUGIN_SLUG, {}) or {}
+    missing = [k for k in ("librenms_url", "librenms_token") if not cfg.get(k)]
+    if missing:
+        raise RuntimeError(
+            "EndpointLocator 插件配置缺失："
+            f"{', '.join(missing)}。请在 NetBox 的 PLUGINS_CONFIG['{PLUGIN_SLUG}'] 中设置。"
+        )
+    return cfg
 
 
 def is_ip(value: str) -> bool:
@@ -35,8 +44,18 @@ def normalize_mac(value: str) -> str:
 
 
 def _get(path: str) -> Dict[str, Any]:
-    url = f"{LIBRENMS_URL}{path}"
-    resp = requests.get(url, headers=HEADERS, verify=VERIFY_SSL, timeout=TIMEOUT)
+    cfg = _get_plugin_cfg()
+    base_url = str(cfg["librenms_url"]).rstrip("/") + "/"
+    url = urljoin(base_url, path.lstrip("/"))
+
+    headers = {
+        "X-Auth-Token": cfg["librenms_token"],
+        "Accept": "application/json",
+    }
+    verify_ssl = cfg.get("verify_ssl", False)
+    timeout = cfg.get("timeout", 15)
+
+    resp = requests.get(url, headers=headers, verify=verify_ssl, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
