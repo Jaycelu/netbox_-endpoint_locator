@@ -1,0 +1,94 @@
+{% extends 'base/layout.html' %}
+
+{% block title %}Endpoint Locator{% endblock %}
+
+{% block header %}
+<div class="page-header">
+  <div class="container-fluid">
+    <h1>Endpoint Locator</h1>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="container-fluid">
+  <div class="card mb-3">
+    <div class="card-header">
+      <strong>终端定位</strong>
+    </div>
+    <div class="card-body">
+      <form method="get">
+        <div class="row">
+          <div class="col-md-8">
+            {{ form.q }}
+          </div>
+          <div class="col-md-4">
+            <button type="submit" class="btn btn-primary">查询</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  {% if error %}
+  <div class="alert alert-danger">
+    {{ error }}
+  </div>
+  {% endif %}
+
+  {% if result %}
+  <div class="card">
+    <div class="card-header">
+      <strong>查询结果</strong>
+    </div>
+    <div class="card-body">
+      <table class="table table-hover">
+        <tr>
+          <th>查询值</th>
+          <td>{{ result.query }}</td>
+        </tr>
+        <tr>
+          <th>查询类型</th>
+          <td>{{ result.query_type }}</td>
+        </tr>
+        <tr>
+          <th>MAC</th>
+          <td>{{ result.mac }}</td>
+        </tr>
+        <tr>
+          <th>LibreNMS 主机</th>
+          <td>{{ result.hostname }}</td>
+        </tr>
+        <tr>
+          <th>交换机/设备</th>
+          <td>{{ result.device_name }}</td>
+        </tr>
+        <tr>
+          <th>接口</th>
+          <td>{{ result.interface }}</td>
+        </tr>
+        <tr>
+          <th>VLAN</th>
+          <td>{{ result.vlan }}</td>
+        </tr>
+        <tr>
+          <th>NetBox 设备</th>
+          <td>
+            {% if result.netbox_device %}
+              <a href="{{ result.netbox_device.get_absolute_url }}">{{ result.netbox_device.name }}</a>
+            {% else %}
+              未匹配
+            {% endif %}
+          </td>
+        </tr>
+      </table>
+
+      <details>
+        <summary>原始返回</summary>
+        <pre>{{ result.raw|pprint }}</pre>
+      </details>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
