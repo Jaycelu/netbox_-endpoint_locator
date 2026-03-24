@@ -20,8 +20,8 @@
 
 ### 1) 组件划分
 
-- `netbox_endpoint_locator/plugin.py`
-  - 负责插件注册、配置项定义（`PLUGINS_CONFIG`）、菜单 base_url 等元信息
+- `netbox_endpoint_locator/__init__.py`
+  - 负责 `PluginConfig` 注册（**必须在此文件中定义**，NetBox 才能正确解析默认的 `navigation.menu` / `navigation.menu_items` 路径）、`PLUGINS_CONFIG` 必填项、base_url 等
 - `netbox_endpoint_locator/navigation.py`
   - 定义插件菜单项 `Endpoint Locator -> Lookup`
 - `netbox_endpoint_locator/urls.py`
@@ -141,7 +141,7 @@ systemctl restart netbox
 ## 兼容性与版本建议
 
 - 目标：NetBox `4.4.x`
-- 插件在 `plugin.py` 中声明 `min_version = 4.0.0`
+- 插件在 `__init__.py` 的 `PluginConfig` 中声明 `min_version = 4.0.0`
 - 但实际建议以你运行的具体版本进行验证
 
 你当前 NetBox 是 `v4.4.10`：建议优先按该版本验证。
@@ -160,4 +160,8 @@ systemctl restart netbox
 3. 匹配不到 NetBox Device（“未匹配”）
    - 插件会尝试用“管理 IP”匹配 `primary_ip4`
    - 确保 NetBox 设备的 `primary_ip4` 与 LibreNMS 的 `hostname`/管理 IP 关联方式一致
+
+4. 能通过 `/plugins/endpoint-locator/lookup/` 打开页面，但左侧主导航没有 “Endpoint Locator”
+   - 若 `PluginConfig` 写在单独的 `plugin.py` 里，NetBox 会按 `netbox_endpoint_locator.plugin.navigation` 去找 `navigation.py`，路径错误会导致**菜单永远不注册**（URL 仍可能正常）。
+   - 本仓库已改为在包根目录的 `__init__.py` 中定义 `PluginConfig`（与官方 Diode 插件一致）。更新代码后请**重启 NetBox**。
 
