@@ -50,6 +50,16 @@ class LibreNMSSelectionTests(unittest.TestCase):
         self.assertEqual(picked["port_id"], 103)
         self.assertEqual(picked["vlan_id"], 997)
 
+    def test_pick_fdb_record_prefers_vlan_even_without_device_hint(self):
+        records = [
+            {"port_id": 101, "vlan_id": 109},
+            {"port_id": 202, "vlan_id": 997},
+        ]
+
+        picked = librenms.pick_fdb_record(records, preferred_vlan="997")
+
+        self.assertEqual(picked["port_id"], 202)
+
     def test_extract_terminal_vlan_reads_vlan_interface_name(self):
         vlan = librenms.extract_terminal_vlan({"ifName": "Vlan-interface997"})
 
@@ -65,6 +75,21 @@ class LibreNMSSelectionTests(unittest.TestCase):
         vlan = librenms.extract_vlan_from_interface_fields(arp_record)
 
         self.assertEqual(vlan, "997")
+
+    def test_records_wrap_single_dict_payloads(self):
+        records = librenms._records({"ports_fdb": {"port_id": 202, "vlan_id": 997}})
+
+        self.assertEqual(records, [{"port_id": 202, "vlan_id": 997}])
+
+    def test_filter_fdb_records_by_mac_matches_normalized_values(self):
+        records = [
+            {"mac_address": "9c:e8:95:18:ff:d6", "vlan_id": 997},
+            {"mac_address": "aa:bb:cc:dd:ee:ff", "vlan_id": 109},
+        ]
+
+        matched = librenms.filter_fdb_records_by_mac(records, "9ce89518ffd6")
+
+        self.assertEqual(matched, [{"mac_address": "9c:e8:95:18:ff:d6", "vlan_id": 997}])
 
 
 if __name__ == "__main__":

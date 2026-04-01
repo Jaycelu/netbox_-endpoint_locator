@@ -9,9 +9,11 @@ from .forms import EndpointLookupForm
 from .librenms import (
     extract_vlan_from_interface_fields,
     extract_terminal_vlan,
+    filter_fdb_records_by_mac,
     is_ip,
     normalize_mac,
     lookup_arp_by_ip,
+    lookup_device_fdb,
     lookup_fdb_by_mac,
     lookup_fdb_detail_by_mac,
     lookup_port_by_id,
@@ -147,10 +149,46 @@ class EndpointLookupView(View):
         vlan = extract_terminal_vlan(fdb_record, port_info, detail_record)
         return best, vlan
 
-    def locate_by_mac(self, mac, preferred_device_id=None, preferred_vlan=None):
+    @staticmethod
+    def _get_device_lookup_key(port_info, fallback_device_id=None):
+        if isinstance(port_info, dict):
+            device = port_info.get("device")
+            if isinstance(device, dict):
+                for key in ("hostname", "sysName", "display", "name"):
+                    value = device.get(key)
+                    if value:
+                        return str(value).strip()
+
+            for key in ("hostname", "device_hostname", "device_id"):
+                value = port_info.get(key)
+                if value:
+                    return str(value).strip()
+
+        if fallback_device_id:
+            return str(fallback_device_id).strip()
+
+        return None
+
+    def locate_by_mac(self, mac, preferred_device=None, preferred_device_id=None, preferred_vlan=None):
         fdb_records = lookup_fdb_by_mac(mac)
         port_records = lookup_port_by_mac(mac)
         fdb_detail_records = lookup_fdb_detail_by_mac(mac)
+        device_key = preferred_device
+
+        if not device_key and port_records:
+            device_key = self._get_device_lookup_key(port_records[0], fallback_device_id=preferred_device_id)
+
+        if device_key:
+            device_fdb_records = filter_fdb_records_by_mac(lookup_device_fdb(device_key), mac)
+            fdb_record = pick_fdb_record(
+                device_fdb_records,
+                preferred_device_id=preferred_device_id,
+                preferred_vlan=preferred_vlan,
+                port_records=port_records,
+            )
+            if fdb_record:
+                return self._resolve_fdb_result(fdb_record, fdb_detail_records)
+
         fdb_record = pick_fdb_record(
             fdb_records,
             preferred_device_id=preferred_device_id,
@@ -230,8 +268,13 @@ class EndpointLookupView(View):
                         preferred_device_id = preferred_device_id or arp_port.get("device_id")
                         preferred_vlan = preferred_vlan or extract_vlan_from_interface_fields(arp_port)
 
+                preferred_device = self._get_device_lookup_key(
+                    arp_port if arp_record and arp_record.get("port_id") else arp_record,
+                    fallback_device_id=preferred_device_id,
+                )
                 best, vlan = self.locate_by_mac(
                     mac,
+                    preferred_device=preferred_device,
                     preferred_device_id=preferred_device_id,
                     preferred_vlan=preferred_vlan,
                 )

@@ -1,7 +1,7 @@
 import ipaddress
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import requests
 from django.conf import settings
@@ -65,6 +65,8 @@ def _records(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         value = data.get(key)
         if isinstance(value, list):
             return value
+        if isinstance(value, dict):
+            return [value]
     if isinstance(data, list):
         return data
     return []
@@ -80,6 +82,10 @@ def lookup_fdb_by_mac(mac: str) -> List[Dict[str, Any]]:
 
 def lookup_fdb_detail_by_mac(mac: str) -> List[Dict[str, Any]]:
     return _records(_get(f"/api/v0/resources/fdb/{mac}/detail"))
+
+
+def lookup_device_fdb(device: Any) -> List[Dict[str, Any]]:
+    return _records(_get(f"/api/v0/devices/{quote(str(device), safe='')}/fdb"))
 
 
 def lookup_port_by_mac(mac: str) -> List[Dict[str, Any]]:
@@ -264,6 +270,26 @@ def _same_id(left: Any, right: Any) -> bool:
     return left_value == right_value
 
 
+def filter_fdb_records_by_mac(records: List[Dict[str, Any]], mac: str) -> List[Dict[str, Any]]:
+    matched: List[Dict[str, Any]] = []
+    normalized_target = normalize_mac(mac)
+
+    for item in records:
+        value = item.get("mac_address") or item.get("mac")
+        if not value:
+            continue
+
+        try:
+            normalized_value = normalize_mac(str(value))
+        except ValueError:
+            continue
+
+        if normalized_value == normalized_target:
+            matched.append(item)
+
+    return matched
+
+
 def pick_fdb_record(
     records: List[Dict[str, Any]],
     preferred_device_id: Any = None,
@@ -278,6 +304,11 @@ def pick_fdb_record(
     if preferred_device_id and normalized_vlan:
         for item in records:
             if _same_id(item.get("device_id"), preferred_device_id) and _same_id(item.get("vlan_id"), normalized_vlan):
+                return item
+
+    if normalized_vlan:
+        for item in records:
+            if _same_id(item.get("vlan_id"), normalized_vlan):
                 return item
 
     if preferred_device_id:
