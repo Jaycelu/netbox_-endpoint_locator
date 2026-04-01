@@ -55,6 +55,17 @@ class LibreNMSSelectionTests(unittest.TestCase):
 
         self.assertEqual(vlan, "997")
 
+    def test_extract_vlan_from_interface_fields_ignores_unrelated_vlan_keys(self):
+        arp_record = {
+            "ifVlan": 109,
+            "ifName": "Vlan-interface997",
+            "remote_interface": "Vlan-interface997",
+        }
+
+        vlan = librenms.extract_vlan_from_interface_fields(arp_record)
+
+        self.assertEqual(vlan, "997")
+
 
 if __name__ == "__main__":
     unittest.main()

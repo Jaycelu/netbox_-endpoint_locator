@@ -7,6 +7,7 @@ from ipam.models import IPAddress
 
 from .forms import EndpointLookupForm
 from .librenms import (
+    extract_vlan_from_interface_fields,
     extract_terminal_vlan,
     is_ip,
     normalize_mac,
@@ -218,7 +219,7 @@ class EndpointLookupView(View):
                     return render(request, self.template_name, context)
 
                 preferred_device_id = arp_record.get("device_id") if arp_record else None
-                preferred_vlan = extract_terminal_vlan(arp_record)
+                preferred_vlan = extract_vlan_from_interface_fields(arp_record)
 
                 if arp_record and arp_record.get("port_id"):
                     arp_port = lookup_port_by_id(
@@ -227,7 +228,7 @@ class EndpointLookupView(View):
                     )
                     if arp_port:
                         preferred_device_id = preferred_device_id or arp_port.get("device_id")
-                        preferred_vlan = preferred_vlan or extract_terminal_vlan(arp_port)
+                        preferred_vlan = preferred_vlan or extract_vlan_from_interface_fields(arp_port)
 
                 best, vlan = self.locate_by_mac(
                     mac,

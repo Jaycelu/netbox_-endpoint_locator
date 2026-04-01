@@ -173,6 +173,46 @@ def _extract_vlan_from_interface_name(value: Any) -> Optional[str]:
     return None
 
 
+def extract_vlan_from_interface_fields(record: Any) -> str:
+    """
+    Extract VLAN hints from explicit interface-name fields only.
+
+    This is safer for ARP responses, which may include unrelated nested VLAN
+    fields that describe the local routed interface rather than the endpoint's
+    L2 VLAN in the FDB table.
+    """
+
+    interface_keys = (
+        "port",
+        "ifName",
+        "ifDescr",
+        "ifAlias",
+        "port_label",
+        "portName",
+        "remote_interface",
+        "remote_port",
+    )
+
+    for key in interface_keys:
+        value = None
+        if isinstance(record, dict):
+            value = record.get(key)
+        if value is None:
+            continue
+
+        if isinstance(value, dict):
+            nested_vlan = extract_vlan_from_interface_fields(value)
+            if nested_vlan:
+                return nested_vlan
+            continue
+
+        vlan = _extract_vlan_from_interface_name(value)
+        if vlan:
+            return vlan
+
+    return ""
+
+
 def extract_terminal_vlan(*sources: Any) -> str:
     """
     Extract the endpoint VLAN strictly from ordered LibreNMS responses.
