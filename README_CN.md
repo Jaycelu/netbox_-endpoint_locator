@@ -44,11 +44,14 @@
 views.py 解析 q 的类型
   - IP: 调用 lookup_arp_by_ip
         从 ARP 记录中提取 MAC
-        再调用 lookup_fdb_detail_by_mac
-        并补查 lookup_fdb_by_mac 以提取 vlan_id
-        若 FDB 无结果，再调用 lookup_port_by_mac
+        并根据 ARP 返回的 port_id 补查 lookup_port_by_id
+        锁定当前 IP 所在的设备上下文 / SVI VLAN
+        再调用 lookup_fdb_by_mac 精确匹配同设备的 FDB 记录
+        最后调用 lookup_port_by_id 回填 FDB 命中端口的接口名
+        若 FDB 无结果，再调用 lookup_fdb_detail_by_mac / lookup_port_by_mac 兜底
   - MAC: 直接调用 lookup_fdb_detail_by_mac
-        并补查 lookup_fdb_by_mac 以提取 vlan_id
+        并补查 lookup_fdb_by_mac 作为 VLAN 真值来源
+        再调用 lookup_port_by_id 回填命中端口的接口名
         若 FDB 无结果，再调用 lookup_port_by_mac
         |
         v
@@ -195,13 +198,17 @@ PLUGINS_CONFIG = {
 具体会调用这些 API：
 
 - `GET /api/v0/resources/ip/arp/<ip>`
-  - 作用：先把 IP 解析成 MAC
-- `GET /api/v0/resources/fdb/<mac>/detail`
-  - 作用：拿到人类可读的交换机名、接口名
+  - 作用：先把 IP 解析成 MAC，并保留这条 ARP 所在的 `port_id`
+- `GET /api/v0/ports/<port_id>?with=device`
+  - 作用：拿到 ARP 命中接口所属设备，用它锁定“当前这台设备”的 FDB 上下文
 - `GET /api/v0/resources/fdb/<mac>`
-  - 作用：补提 `vlan_id`，因为 `detail` 常常没有 VLAN
+  - 作用：按同设备上下文精确匹配这条 MAC 的 `vlan_id` 与命中端口
+- `GET /api/v0/ports/<fdb_port_id>?with=device`
+  - 作用：把 FDB 命中的 `port_id` 回填成最终展示的接口名/设备名
+- `GET /api/v0/resources/fdb/<mac>/detail`
+  - 作用：只在需要时补充更友好的设备名、接口名
 - `GET /api/v0/ports/mac/<mac>?filter=first`
-  - 作用：如果 FDB detail 没法定位接口，再做兜底端口查询
+  - 作用：如果 FDB 没法定位，再做兜底端口查询
 
 ### 2. 输入 MAC 时
 

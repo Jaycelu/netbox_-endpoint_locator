@@ -1,6 +1,6 @@
 import ipaddress
 import re
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import urljoin
 
 import requests
@@ -61,7 +61,7 @@ def _get(path: str) -> Dict[str, Any]:
 
 
 def _records(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    for key in ("arp", "ports_fdb", "ports", "data", "items", "results"):
+    for key in ("arp", "ports_fdb", "port", "ports", "data", "items", "results"):
         value = data.get(key)
         if isinstance(value, list):
             return value
@@ -86,6 +86,19 @@ def lookup_port_by_mac(mac: str) -> List[Dict[str, Any]]:
     return _records(_get(f"/api/v0/ports/mac/{mac}?filter=first"))
 
 
+def lookup_port_by_id(port_id: Any, with_relations: Optional[Sequence[str]] = None) -> Optional[Dict[str, Any]]:
+    query = ""
+    if with_relations:
+        allowed = [str(item).strip() for item in with_relations if str(item).strip()]
+        if allowed:
+            query = f"?with={','.join(allowed)}"
+
+    records = _records(_get(f"/api/v0/ports/{port_id}{query}"))
+    if not records:
+        return None
+    return records[0]
+
+
 def parse_mac_from_arp(records: List[Dict[str, Any]]) -> Optional[str]:
     for item in records:
         for key in ("mac_address", "mac", "ifPhysAddress", "phys_address"):
@@ -95,6 +108,26 @@ def parse_mac_from_arp(records: List[Dict[str, Any]]) -> Optional[str]:
                     return normalize_mac(str(value))
                 except ValueError:
                     continue
+    return None
+
+
+def pick_arp_record(records: List[Dict[str, Any]], ip: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    valid_records: List[Dict[str, Any]] = []
+    ip_text = str(ip).strip() if ip else ""
+
+    for item in records:
+        mac = parse_mac_from_arp([item])
+        if not mac:
+            continue
+
+        record_ip = str(item.get("ipv4_address") or item.get("ip") or item.get("address") or "").strip()
+        if ip_text and record_ip == ip_text:
+            return item
+
+        valid_records.append(item)
+
+    if valid_records:
+        return valid_records[0]
     return None
 
 
@@ -119,12 +152,33 @@ def _normalize_vlan_value(value: Any) -> Optional[str]:
     return text
 
 
+def _extract_vlan_from_interface_name(value: Any) -> Optional[str]:
+    if value is None or isinstance(value, (dict, list, tuple, set, bool)):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    patterns = (
+        r"(?i)^vlan[-\s_]*interface[-\s_]*(\d+)$",
+        r"(?i)^vlan[-\s_]*(\d+)$",
+        r"(?i)^vlan\s+(\d+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, text)
+        if match:
+            return match.group(1)
+
+    return None
+
+
 def extract_terminal_vlan(*sources: Any) -> str:
     """
-    Extract the endpoint VLAN strictly from LibreNMS responses.
+    Extract the endpoint VLAN strictly from ordered LibreNMS responses.
 
-    `list_fdb_detail` is convenient for host/interface names but often omits
-    `vlan_id`, so we also scan plain FDB and port/MAC responses as fallback.
+    The first valid VLAN wins. Callers should pass the most authoritative
+    source first, e.g. the matched FDB row before broader fallback records.
     """
 
     vlan_keys = {
@@ -135,23 +189,80 @@ def extract_terminal_vlan(*sources: Any) -> str:
         "ifvlan",
         "dot1qvlanfdbid",
     }
-    seen = set()
-    vlans: List[str] = []
 
     for source in sources:
         for key, value in _walk_key_values(source):
-            if key not in vlan_keys:
+            if key in vlan_keys:
+                vlan = _normalize_vlan_value(value)
+                if vlan:
+                    return vlan
+
+            if key in {"ifname", "ifdescr", "ifalias", "port", "port_label", "portname"}:
+                vlan = _extract_vlan_from_interface_name(value)
+                if vlan:
+                    return vlan
+
+    return ""
+
+
+def _normalized_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    return text
+
+
+def _same_id(left: Any, right: Any) -> bool:
+    left_value = _normalized_id(left)
+    right_value = _normalized_id(right)
+    if not left_value or not right_value:
+        return False
+    return left_value == right_value
+
+
+def pick_fdb_record(
+    records: List[Dict[str, Any]],
+    preferred_device_id: Any = None,
+    preferred_vlan: Optional[str] = None,
+    port_records: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not records:
+        return None
+
+    normalized_vlan = _normalize_vlan_value(preferred_vlan)
+
+    if preferred_device_id and normalized_vlan:
+        for item in records:
+            if _same_id(item.get("device_id"), preferred_device_id) and _same_id(item.get("vlan_id"), normalized_vlan):
+                return item
+
+    if preferred_device_id:
+        for item in records:
+            if _same_id(item.get("device_id"), preferred_device_id):
+                return item
+
+    if port_records:
+        for port in port_records:
+            preferred_port_id = port.get("port_id")
+            if not preferred_port_id:
                 continue
+            for item in records:
+                if _same_id(item.get("port_id"), preferred_port_id):
+                    return item
 
-            vlan = _normalize_vlan_value(value)
-            if vlan and vlan not in seen:
-                seen.add(vlan)
-                vlans.append(vlan)
+        for port in port_records:
+            preferred_port_device_id = port.get("device_id")
+            if not preferred_port_device_id:
+                continue
+            for item in records:
+                if _same_id(item.get("device_id"), preferred_port_device_id):
+                    return item
 
-    if not vlans:
-        return ""
-
-    return ", ".join(vlans)
+    return records[0]
 
 
 def pick_best_result(records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
