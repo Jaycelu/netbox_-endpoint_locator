@@ -7,9 +7,11 @@ from ipam.models import IPAddress
 
 from .forms import EndpointLookupForm
 from .librenms import (
+    extract_terminal_vlan,
     is_ip,
     normalize_mac,
     lookup_arp_by_ip,
+    lookup_fdb_by_mac,
     lookup_fdb_detail_by_mac,
     lookup_port_by_mac,
     parse_mac_from_arp,
@@ -38,7 +40,20 @@ class EndpointLookupView(View):
 
         return Device.objects.filter(primary_ip4=ip_obj).first()
 
-    def build_result(self, q, query_type, mac, best):
+    def locate_by_mac(self, mac):
+        fdb_detail_records = lookup_fdb_detail_by_mac(mac)
+        fdb_records = lookup_fdb_by_mac(mac)
+        best = pick_best_result(fdb_detail_records)
+        port_records = []
+
+        if not best:
+            port_records = lookup_port_by_mac(mac)
+            best = pick_best_result(port_records)
+
+        vlan = extract_terminal_vlan(best, fdb_detail_records, fdb_records, port_records)
+        return best, vlan
+
+    def build_result(self, q, query_type, mac, best, vlan):
         hostname = str(
             best.get("hostname")
             or best.get("device_hostname")
@@ -55,7 +70,7 @@ class EndpointLookupView(View):
             "hostname": hostname,
             "device_name": best.get("sysName") or best.get("device_name") or hostname,
             "interface": best.get("ifName") or best.get("port_label") or best.get("port") or "",
-            "vlan": best.get("vlan_id") or best.get("vlan") or "",
+            "vlan": vlan,
             "netbox_device": netbox_device,
             "raw": best,
             "raw_pretty": self._pretty_json(best),
@@ -90,33 +105,23 @@ class EndpointLookupView(View):
                     context["error"] = f"未在 LibreNMS ARP 中找到 {q}"
                     return render(request, self.template_name, context)
 
-                fdb_records = lookup_fdb_detail_by_mac(mac)
-                best = pick_best_result(fdb_records)
-
-                if not best:
-                    port_records = lookup_port_by_mac(mac)
-                    best = pick_best_result(port_records)
+                best, vlan = self.locate_by_mac(mac)
 
                 if not best:
                     context["error"] = f"找到了 MAC {mac}，但未在 FDB/端口表中定位到交换机接口"
                     return render(request, self.template_name, context)
 
-                context["result"] = self.build_result(q, "ip", mac, best)
+                context["result"] = self.build_result(q, "ip", mac, best, vlan)
                 return render(request, self.template_name, context)
 
             mac = normalize_mac(q)
-            fdb_records = lookup_fdb_detail_by_mac(mac)
-            best = pick_best_result(fdb_records)
-
-            if not best:
-                port_records = lookup_port_by_mac(mac)
-                best = pick_best_result(port_records)
+            best, vlan = self.locate_by_mac(mac)
 
             if not best:
                 context["error"] = f"未在 LibreNMS FDB/端口表中找到 MAC {mac}"
                 return render(request, self.template_name, context)
 
-            context["result"] = self.build_result(q, "mac", mac, best)
+            context["result"] = self.build_result(q, "mac", mac, best, vlan)
             return render(request, self.template_name, context)
 
         except Exception as exc:
