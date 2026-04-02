@@ -15,6 +15,7 @@ from .librenms import (
     lookup_arp_by_ip,
     lookup_device_vlans,
     lookup_fdb_by_mac,
+    lookup_fdb_detail_by_mac,
     lookup_port_by_id,
     parse_ip_from_arp,
     parse_mac_from_arp,
@@ -103,6 +104,54 @@ class EndpointLookupView(View):
 
         return names
 
+    def _pick_matching_detail_record(self, records, fdb_record, port_info):
+        if not records:
+            return None
+
+        target_ifnames = self._interface_names(fdb_record, port_info)
+        target_hostnames = {
+            str(value).strip().lower()
+            for value in (
+                ((port_info or {}).get("device") or {}).get("hostname") if isinstance((port_info or {}).get("device"), dict) else "",
+                ((port_info or {}).get("device") or {}).get("sysName") if isinstance((port_info or {}).get("device"), dict) else "",
+                (fdb_record or {}).get("hostname"),
+                (fdb_record or {}).get("device_hostname"),
+            )
+            if value
+        }
+
+        interface_and_host_matches = []
+        interface_matches = []
+        hostname_matches = []
+
+        for item in records:
+            ifname = str(
+                item.get("ifName")
+                or item.get("ifDescr")
+                or item.get("ifAlias")
+                or item.get("port")
+                or ""
+            ).strip().lower()
+            hostname = str(item.get("hostname") or item.get("sysName") or "").strip().lower()
+
+            same_ifname = bool(target_ifnames and ifname in target_ifnames)
+            same_hostname = bool(target_hostnames and hostname in target_hostnames)
+
+            if same_ifname and same_hostname:
+                interface_and_host_matches.append(item)
+            elif same_ifname:
+                interface_matches.append(item)
+            elif same_hostname:
+                hostname_matches.append(item)
+
+        if interface_and_host_matches:
+            return interface_and_host_matches[0]
+        if interface_matches:
+            return interface_matches[0]
+        if hostname_matches:
+            return hostname_matches[0]
+        return records[0]
+
     def _collect_arp_context(self, arp_records):
         context = {
             "records": [],
@@ -166,10 +215,11 @@ class EndpointLookupView(View):
 
         return arp_context["ips"][0] if arp_context["ips"] else ""
 
-    def _build_fdb_candidate(self, fdb_record, arp_context):
+    def _build_fdb_candidate(self, fdb_record, arp_context, fdb_detail_records):
         port_info = self._get_port(fdb_record.get("port_id"))
         device_key = self._get_device_lookup_key(port_info, fallback_device_id=fdb_record.get("device_id"))
         device_vlans = self._get_device_vlans_cached(device_key)
+        detail_record = self._pick_matching_detail_record(fdb_detail_records, fdb_record, port_info)
         vlan = resolve_fdb_vlan(
             fdb_record,
             device_vlans=device_vlans,
@@ -201,6 +251,7 @@ class EndpointLookupView(View):
             "vlan": vlan,
             "fdb": dict(fdb_record),
             "port": port_info,
+            "detail": detail_record,
             "related_ip": related_ip,
             "arp_records": [item["arp"] for item in arp_context["records"]],
         }
@@ -208,12 +259,13 @@ class EndpointLookupView(View):
     def locate_by_mac(self, mac, arp_records=None):
         arp_context = self._collect_arp_context(arp_records or [])
         fdb_records = lookup_fdb_by_mac(mac)
-        candidates = [self._build_fdb_candidate(item, arp_context) for item in fdb_records]
+        fdb_detail_records = lookup_fdb_detail_by_mac(mac)
+        candidates = [self._build_fdb_candidate(item, arp_context, fdb_detail_records) for item in fdb_records]
 
         return pick_scored_candidate(candidates)
 
     @staticmethod
-    def _device_names(port_info, fallback_record):
+    def _device_names(port_info, fallback_record, detail_record=None):
         device = (port_info or {}).get("device") if isinstance(port_info, dict) else None
         hostname = ""
         device_name = ""
@@ -237,6 +289,7 @@ class EndpointLookupView(View):
             hostname = str(
                 (fallback_record or {}).get("hostname")
                 or (fallback_record or {}).get("device_hostname")
+                or (detail_record or {}).get("hostname")
                 or ""
             ).strip()
 
@@ -244,6 +297,7 @@ class EndpointLookupView(View):
             device_name = str(
                 (fallback_record or {}).get("sysName")
                 or (fallback_record or {}).get("device_name")
+                or (detail_record or {}).get("sysName")
                 or hostname
             ).strip()
 
@@ -252,7 +306,8 @@ class EndpointLookupView(View):
     def build_result(self, q, query_type, mac, candidate):
         port_info = candidate.get("port") or {}
         fdb_record = candidate.get("fdb") or {}
-        hostname, device_name = self._device_names(port_info, fdb_record)
+        detail_record = candidate.get("detail") or {}
+        hostname, device_name = self._device_names(port_info, fdb_record, detail_record=detail_record)
 
         netbox_device = self.get_netbox_device_by_mgmt_ip(hostname)
         display_ip = q if query_type == "ip" else candidate.get("related_ip", "")
@@ -260,6 +315,9 @@ class EndpointLookupView(View):
             port_info.get("ifName")
             or port_info.get("ifDescr")
             or port_info.get("ifAlias")
+            or detail_record.get("ifName")
+            or detail_record.get("ifDescr")
+            or detail_record.get("ifAlias")
             or fdb_record.get("ifName")
             or fdb_record.get("port")
             or ""
@@ -269,6 +327,7 @@ class EndpointLookupView(View):
             "related_ip": candidate.get("related_ip"),
             "fdb": fdb_record,
             "port": port_info,
+            "detail": detail_record,
             "arp_records": candidate.get("arp_records", []),
         }
 

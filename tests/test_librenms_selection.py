@@ -28,6 +28,9 @@ librenms = load_librenms_module()
 
 
 class LibreNMSSelectionTests(unittest.TestCase):
+    def test_format_mac_readable_adds_colons(self):
+        self.assertEqual(librenms.format_mac_readable("9ce89518ffd6"), "9c:e8:95:18:ff:d6")
+
     def test_pick_arp_record_prefers_exact_ip_match(self):
         records = [
             {"ipv4_address": "172.22.1.2", "mac_address": "aa:bb:cc:dd:ee:ff"},
@@ -64,6 +67,14 @@ class LibreNMSSelectionTests(unittest.TestCase):
 
         self.assertEqual(vlan, "997")
 
+    def test_resolve_fdb_vlan_does_not_guess_access_vlan_when_fdb_id_is_unmapped(self):
+        fdb_record = {"device_id": 10, "port_id": 101, "vlan_id": 20000}
+        port_info = {"vlans": [{"vlan": 1, "untagged": 1}]}
+
+        vlan = librenms.resolve_fdb_vlan(fdb_record, device_vlans=[], port_info=port_info)
+
+        self.assertEqual(vlan, "")
+
     def test_extract_terminal_vlan_reads_vlan_interface_name(self):
         vlan = librenms.extract_terminal_vlan({"ifName": "Vlan-interface997"})
 
@@ -89,6 +100,63 @@ class LibreNMSSelectionTests(unittest.TestCase):
         records = librenms._records({"vlans": {"vlan_id": 20000, "vlan_vlan": 997}})
 
         self.assertEqual(records, [{"vlan_id": 20000, "vlan_vlan": 997}])
+
+    def test_lookup_arp_by_mac_uses_readable_mac_path(self):
+        seen = {}
+
+        original_get = librenms._get
+        try:
+            def fake_get(path):
+                seen["path"] = path
+                return {"arp": []}
+
+            librenms._get = fake_get
+            librenms.lookup_arp_by_mac("9ce89518ffd6")
+        finally:
+            librenms._get = original_get
+
+        self.assertEqual(seen["path"], "/api/v0/resources/ip/arp/9c%3Ae8%3A95%3A18%3Aff%3Ad6")
+
+    def test_lookup_device_vlans_uses_resources_vlan_endpoint(self):
+        seen = {}
+
+        original_get = librenms._get
+        try:
+            def fake_get(path):
+                seen["path"] = path
+                return {"vlans": []}
+
+            librenms._get = fake_get
+            librenms.lookup_device_vlans("10.0.0.1")
+        finally:
+            librenms._get = original_get
+
+        self.assertEqual(seen["path"], "/api/v0/resources/vlans?hostname=10.0.0.1")
+
+    def test_lookup_port_by_id_fetches_relations_separately(self):
+        seen = []
+
+        def fake_get(path):
+            seen.append(path)
+            if path.endswith("?with=device"):
+                return {"port": [{"port_id": 101, "device": {"hostname": "10.0.0.1"}}]}
+            if path.endswith("?with=vlans"):
+                return {"port": [{"port_id": 101, "vlans": [{"vlan": 997}]}]}
+            return {"port": [{"port_id": 101, "ifName": "BA2"}]}
+
+        original_get = librenms._get
+        try:
+            librenms._get = fake_get
+            result = librenms.lookup_port_by_id(101, with_relations=["device", "vlans"])
+        finally:
+            librenms._get = original_get
+
+        self.assertEqual(
+            seen,
+            ["/api/v0/ports/101?with=device", "/api/v0/ports/101?with=vlans"],
+        )
+        self.assertEqual(result["device"]["hostname"], "10.0.0.1")
+        self.assertEqual(result["vlans"], [{"vlan": 997}])
 
     def test_filter_fdb_records_by_mac_matches_normalized_values(self):
         records = [

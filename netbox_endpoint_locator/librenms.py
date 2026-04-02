@@ -43,6 +43,11 @@ def normalize_mac(value: str) -> str:
     return value
 
 
+def format_mac_readable(value: str) -> str:
+    normalized = normalize_mac(value)
+    return ":".join(normalized[index : index + 2] for index in range(0, 12, 2))
+
+
 def _get(path: str) -> Dict[str, Any]:
     cfg = _get_plugin_cfg()
     base_url = str(cfg["librenms_url"]).rstrip("/") + "/"
@@ -81,7 +86,7 @@ def lookup_arp_by_ip(ip: str) -> List[Dict[str, Any]]:
 
 
 def lookup_arp_by_mac(mac: str) -> List[Dict[str, Any]]:
-    return lookup_arp(mac)
+    return lookup_arp(format_mac_readable(mac))
 
 
 def lookup_fdb_by_mac(mac: str) -> List[Dict[str, Any]]:
@@ -97,7 +102,8 @@ def lookup_device_fdb(device: Any) -> List[Dict[str, Any]]:
 
 
 def lookup_device_vlans(device: Any) -> List[Dict[str, Any]]:
-    return _records(_get(f"/api/v0/devices/{quote(str(device), safe='')}/vlans"))
+    device_text = str(device).strip()
+    return _records(_get(f"/api/v0/resources/vlans?hostname={quote(device_text, safe='')}"))
 
 
 def lookup_port_by_mac(mac: str) -> List[Dict[str, Any]]:
@@ -105,13 +111,27 @@ def lookup_port_by_mac(mac: str) -> List[Dict[str, Any]]:
 
 
 def lookup_port_by_id(port_id: Any, with_relations: Optional[Sequence[str]] = None) -> Optional[Dict[str, Any]]:
-    query = ""
-    if with_relations:
-        allowed = [str(item).strip() for item in with_relations if str(item).strip()]
-        if allowed:
-            query = f"?with={','.join(allowed)}"
+    allowed = [str(item).strip() for item in with_relations or [] if str(item).strip()]
+    if not allowed:
+        records = _records(_get(f"/api/v0/ports/{port_id}"))
+        if not records:
+            return None
+        return records[0]
 
-    records = _records(_get(f"/api/v0/ports/{port_id}{query}"))
+    merged: Dict[str, Any] = {}
+    for relation in allowed:
+        records = _records(_get(f"/api/v0/ports/{port_id}?with={quote(relation, safe='')}"))
+        if not records:
+            continue
+
+        for key, value in records[0].items():
+            if value is not None:
+                merged[key] = value
+
+    if merged:
+        return merged
+
+    records = _records(_get(f"/api/v0/ports/{port_id}"))
     if not records:
         return None
     return records[0]
@@ -380,17 +400,24 @@ def resolve_fdb_vlan(
         return vlan_map[vlan_row_id]
 
     port_vlans = collect_port_vlan_values(port_info)
-    arp_vlan = extract_vlan_from_interface_fields(arp_record) or extract_terminal_vlan(port_info)
+    arp_vlan = extract_vlan_from_interface_fields(arp_record)
+    if not arp_vlan:
+        arp_vlan = extract_vlan_from_interface_fields(port_info)
 
     if arp_vlan and (not port_vlans or arp_vlan in port_vlans):
         return arp_vlan
 
-    if len(port_vlans) == 1:
-        return port_vlans[0]
+    # If FDB already references a VLAN row but we can't map it back to a real
+    # VLAN number, do not guess from the port's access/default VLAN.
+    if vlan_row_id:
+        return ""
 
     untagged_vlan = _extract_untagged_port_vlan(port_info)
     if untagged_vlan:
         return untagged_vlan
+
+    if len(port_vlans) == 1:
+        return port_vlans[0]
 
     if arp_vlan:
         return arp_vlan
