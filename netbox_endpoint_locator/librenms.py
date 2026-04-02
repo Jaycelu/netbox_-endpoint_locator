@@ -61,7 +61,7 @@ def _get(path: str) -> Dict[str, Any]:
 
 
 def _records(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    for key in ("arp", "ports_fdb", "port", "ports", "data", "items", "results"):
+    for key in ("arp", "ports_fdb", "port", "ports", "vlans", "data", "items", "results"):
         value = data.get(key)
         if isinstance(value, list):
             return value
@@ -72,8 +72,16 @@ def _records(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+def lookup_arp(query: str) -> List[Dict[str, Any]]:
+    return _records(_get(f"/api/v0/resources/ip/arp/{quote(str(query), safe='')}"))
+
+
 def lookup_arp_by_ip(ip: str) -> List[Dict[str, Any]]:
-    return _records(_get(f"/api/v0/resources/ip/arp/{ip}"))
+    return lookup_arp(ip)
+
+
+def lookup_arp_by_mac(mac: str) -> List[Dict[str, Any]]:
+    return lookup_arp(mac)
 
 
 def lookup_fdb_by_mac(mac: str) -> List[Dict[str, Any]]:
@@ -86,6 +94,10 @@ def lookup_fdb_detail_by_mac(mac: str) -> List[Dict[str, Any]]:
 
 def lookup_device_fdb(device: Any) -> List[Dict[str, Any]]:
     return _records(_get(f"/api/v0/devices/{quote(str(device), safe='')}/fdb"))
+
+
+def lookup_device_vlans(device: Any) -> List[Dict[str, Any]]:
+    return _records(_get(f"/api/v0/devices/{quote(str(device), safe='')}/vlans"))
 
 
 def lookup_port_by_mac(mac: str) -> List[Dict[str, Any]]:
@@ -115,6 +127,18 @@ def parse_mac_from_arp(records: List[Dict[str, Any]]) -> Optional[str]:
                 except ValueError:
                     continue
     return None
+
+
+def parse_ip_from_arp(record: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(record, dict):
+        return ""
+
+    for key in ("ipv4_address", "ip", "address"):
+        value = record.get(key)
+        if value:
+            return str(value).strip()
+
+    return ""
 
 
 def pick_arp_record(records: List[Dict[str, Any]], ip: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -251,6 +275,38 @@ def extract_terminal_vlan(*sources: Any) -> str:
     return ""
 
 
+def collect_port_vlan_values(port_info: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(port_info, dict):
+        return []
+
+    values: List[str] = []
+    for item in port_info.get("vlans") or []:
+        if not isinstance(item, dict):
+            continue
+        vlan = _normalize_vlan_value(item.get("vlan"))
+        if vlan and vlan not in values:
+            values.append(vlan)
+
+    return values
+
+
+def _extract_untagged_port_vlan(port_info: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(port_info, dict):
+        return ""
+
+    for item in port_info.get("vlans") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("untagged") or "").strip() not in {"1", "true", "True"}:
+            continue
+
+        vlan = _normalize_vlan_value(item.get("vlan"))
+        if vlan:
+            return vlan
+
+    return ""
+
+
 def _normalized_id(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -290,50 +346,103 @@ def filter_fdb_records_by_mac(records: List[Dict[str, Any]], mac: str) -> List[D
     return matched
 
 
-def pick_fdb_record(
-    records: List[Dict[str, Any]],
-    preferred_device_id: Any = None,
-    preferred_vlan: Optional[str] = None,
-    port_records: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[Dict[str, Any]]:
-    if not records:
+def build_device_vlan_map(vlan_records: List[Dict[str, Any]]) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+
+    for item in vlan_records:
+        if not isinstance(item, dict):
+            continue
+
+        vlan_row_id = _normalized_id(item.get("vlan_id"))
+        vlan_number = _normalize_vlan_value(item.get("vlan_vlan") or item.get("vlan"))
+        if vlan_row_id and vlan_number:
+            mapping[vlan_row_id] = vlan_number
+
+    return mapping
+
+
+def resolve_fdb_vlan(
+    fdb_record: Optional[Dict[str, Any]],
+    device_vlans: Optional[List[Dict[str, Any]]] = None,
+    port_info: Optional[Dict[str, Any]] = None,
+    arp_record: Optional[Dict[str, Any]] = None,
+) -> str:
+    if not isinstance(fdb_record, dict):
+        return ""
+
+    explicit_vlan = _normalize_vlan_value(fdb_record.get("vlan_vlan") or fdb_record.get("vlan"))
+    if explicit_vlan:
+        return explicit_vlan
+
+    vlan_map = build_device_vlan_map(device_vlans or [])
+    vlan_row_id = _normalized_id(fdb_record.get("vlan_id"))
+    if vlan_row_id and vlan_row_id in vlan_map:
+        return vlan_map[vlan_row_id]
+
+    port_vlans = collect_port_vlan_values(port_info)
+    arp_vlan = extract_vlan_from_interface_fields(arp_record) or extract_terminal_vlan(port_info)
+
+    if arp_vlan and (not port_vlans or arp_vlan in port_vlans):
+        return arp_vlan
+
+    if len(port_vlans) == 1:
+        return port_vlans[0]
+
+    untagged_vlan = _extract_untagged_port_vlan(port_info)
+    if untagged_vlan:
+        return untagged_vlan
+
+    if arp_vlan:
+        return arp_vlan
+
+    return extract_terminal_vlan(fdb_record, port_info)
+
+
+def score_fdb_candidate(
+    record: Dict[str, Any],
+    preferred_port_ids: Optional[Iterable[Any]] = None,
+    preferred_device_ids: Optional[Iterable[Any]] = None,
+    preferred_vlans: Optional[Iterable[Any]] = None,
+    candidate_vlan: Optional[str] = None,
+) -> int:
+    score = 0
+    port_id = _normalized_id(record.get("port_id"))
+    device_id = _normalized_id(record.get("device_id"))
+
+    normalized_port_ids = {_normalized_id(value) for value in preferred_port_ids or []}
+    normalized_port_ids.discard(None)
+    normalized_device_ids = {_normalized_id(value) for value in preferred_device_ids or []}
+    normalized_device_ids.discard(None)
+    normalized_vlans = {_normalize_vlan_value(value) for value in preferred_vlans or []}
+    normalized_vlans.discard(None)
+
+    if port_id and port_id in normalized_port_ids:
+        score += 1000
+
+    if device_id and device_id in normalized_device_ids:
+        score += 250
+
+    if candidate_vlan and candidate_vlan in normalized_vlans:
+        score += 100
+
+    if port_id:
+        score += 5
+
+    return score
+
+
+def pick_scored_candidate(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not candidates:
         return None
 
-    normalized_vlan = _normalize_vlan_value(preferred_vlan)
+    def sort_key(item: Dict[str, Any]) -> tuple[int, str, str]:
+        return (
+            int(item.get("score") or 0),
+            str(item.get("updated_at") or ""),
+            str(item.get("port_id") or ""),
+        )
 
-    if preferred_device_id and normalized_vlan:
-        for item in records:
-            if _same_id(item.get("device_id"), preferred_device_id) and _same_id(item.get("vlan_id"), normalized_vlan):
-                return item
-
-    if normalized_vlan:
-        for item in records:
-            if _same_id(item.get("vlan_id"), normalized_vlan):
-                return item
-
-    if preferred_device_id:
-        for item in records:
-            if _same_id(item.get("device_id"), preferred_device_id):
-                return item
-
-    if port_records:
-        for port in port_records:
-            preferred_port_id = port.get("port_id")
-            if not preferred_port_id:
-                continue
-            for item in records:
-                if _same_id(item.get("port_id"), preferred_port_id):
-                    return item
-
-        for port in port_records:
-            preferred_port_device_id = port.get("device_id")
-            if not preferred_port_device_id:
-                continue
-            for item in records:
-                if _same_id(item.get("device_id"), preferred_port_device_id):
-                    return item
-
-    return records[0]
+    return sorted(candidates, key=sort_key, reverse=True)[0]
 
 
 def pick_best_result(records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

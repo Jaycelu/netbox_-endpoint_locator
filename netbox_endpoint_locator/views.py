@@ -7,21 +7,21 @@ from ipam.models import IPAddress
 
 from .forms import EndpointLookupForm
 from .librenms import (
+    collect_port_vlan_values,
     extract_vlan_from_interface_fields,
-    extract_terminal_vlan,
-    filter_fdb_records_by_mac,
     is_ip,
     normalize_mac,
+    lookup_arp_by_mac,
     lookup_arp_by_ip,
-    lookup_device_fdb,
+    lookup_device_vlans,
     lookup_fdb_by_mac,
-    lookup_fdb_detail_by_mac,
     lookup_port_by_id,
-    lookup_port_by_mac,
+    parse_ip_from_arp,
     parse_mac_from_arp,
     pick_arp_record,
-    pick_best_result,
-    pick_fdb_record,
+    pick_scored_candidate,
+    resolve_fdb_vlan,
+    score_fdb_candidate,
 )
 
 
@@ -47,109 +47,6 @@ class EndpointLookupView(View):
         return Device.objects.filter(primary_ip4=ip_obj).first()
 
     @staticmethod
-    def _merge_best_record(base, extra):
-        merged = dict(base or {})
-        if not isinstance(extra, dict):
-            return merged
-
-        for key, value in extra.items():
-            if value is not None and key != "device":
-                merged[key] = value
-
-        device = extra.get("device")
-        if isinstance(device, dict):
-            hostname = (
-                device.get("hostname")
-                or device.get("sysName")
-                or device.get("display")
-                or device.get("name")
-                or ""
-            )
-            device_name = (
-                device.get("sysName")
-                or device.get("display")
-                or device.get("name")
-                or hostname
-            )
-
-            if hostname:
-                merged.setdefault("hostname", hostname)
-                merged.setdefault("device_hostname", hostname)
-            if device_name:
-                merged.setdefault("sysName", device_name)
-                merged.setdefault("device_name", device_name)
-
-        return merged
-
-    @staticmethod
-    def _pick_matching_detail_record(records, best):
-        if not records or not best:
-            return None
-
-        target_ifnames = {
-            str(best.get(key)).strip().lower()
-            for key in ("ifName", "ifDescr", "ifAlias", "port", "port_label", "portName")
-            if best.get(key)
-        }
-        target_hostnames = {
-            str(best.get(key)).strip().lower()
-            for key in ("hostname", "device_hostname")
-            if best.get(key)
-        }
-
-        interface_and_host_matches = []
-        interface_matches = []
-        hostname_matches = []
-
-        for item in records:
-            item_ifname = str(
-                item.get("ifName")
-                or item.get("ifDescr")
-                or item.get("ifAlias")
-                or item.get("port")
-                or ""
-            ).strip().lower()
-            item_hostname = str(
-                item.get("hostname")
-                or item.get("device_hostname")
-                or item.get("device")
-                or ""
-            ).strip().lower()
-
-            same_ifname = bool(target_ifnames and item_ifname in target_ifnames)
-            same_hostname = bool(target_hostnames and item_hostname in target_hostnames)
-
-            if same_ifname and same_hostname:
-                interface_and_host_matches.append(item)
-            elif same_ifname:
-                interface_matches.append(item)
-            elif same_hostname:
-                hostname_matches.append(item)
-
-        if interface_and_host_matches:
-            return interface_and_host_matches[0]
-        if interface_matches:
-            return interface_matches[0]
-        if hostname_matches:
-            return hostname_matches[0]
-        return None
-
-    def _resolve_fdb_result(self, fdb_record, fdb_detail_records):
-        best = dict(fdb_record or {})
-        port_info = None
-
-        if best.get("port_id"):
-            port_info = lookup_port_by_id(best.get("port_id"), with_relations=["device"])
-            best = self._merge_best_record(best, port_info)
-
-        detail_record = self._pick_matching_detail_record(fdb_detail_records, best)
-        if detail_record:
-            best = self._merge_best_record(best, detail_record)
-
-        vlan = extract_terminal_vlan(fdb_record, port_info, detail_record)
-        return best, vlan
-
-    @staticmethod
     def _get_device_lookup_key(port_info, fallback_device_id=None):
         if isinstance(port_info, dict):
             device = port_info.get("device")
@@ -169,61 +66,224 @@ class EndpointLookupView(View):
 
         return None
 
-    def locate_by_mac(self, mac, preferred_device=None, preferred_device_id=None, preferred_vlan=None):
-        fdb_records = lookup_fdb_by_mac(mac)
-        port_records = lookup_port_by_mac(mac)
-        fdb_detail_records = lookup_fdb_detail_by_mac(mac)
-        device_key = preferred_device
+    def _get_port(self, port_id):
+        if not port_id:
+            return None
 
-        if not device_key and port_records:
-            device_key = self._get_device_lookup_key(port_records[0], fallback_device_id=preferred_device_id)
-
-        if device_key:
-            device_fdb_records = filter_fdb_records_by_mac(lookup_device_fdb(device_key), mac)
-            fdb_record = pick_fdb_record(
-                device_fdb_records,
-                preferred_device_id=preferred_device_id,
-                preferred_vlan=preferred_vlan,
-                port_records=port_records,
+        cache_key = str(port_id).strip()
+        if cache_key not in self._port_cache:
+            self._port_cache[cache_key] = lookup_port_by_id(
+                port_id,
+                with_relations=["device", "vlans"],
             )
-            if fdb_record:
-                return self._resolve_fdb_result(fdb_record, fdb_detail_records)
 
-        fdb_record = pick_fdb_record(
-            fdb_records,
-            preferred_device_id=preferred_device_id,
-            preferred_vlan=preferred_vlan,
-            port_records=port_records,
+        return self._port_cache[cache_key]
+
+    def _get_device_vlans_cached(self, device_key):
+        if not device_key:
+            return []
+
+        cache_key = str(device_key).strip()
+        if cache_key not in self._device_vlan_cache:
+            self._device_vlan_cache[cache_key] = lookup_device_vlans(device_key)
+
+        return self._device_vlan_cache[cache_key]
+
+    @staticmethod
+    def _interface_names(*records):
+        names = set()
+
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            for key in ("ifName", "ifDescr", "ifAlias", "port", "port_label", "portName"):
+                value = record.get(key)
+                if value:
+                    names.add(str(value).strip().lower())
+
+        return names
+
+    def _collect_arp_context(self, arp_records):
+        context = {
+            "records": [],
+            "port_ids": set(),
+            "device_ids": set(),
+            "vlans": set(),
+            "ips": [],
+            "ip_by_port_id": {},
+            "interfaces": set(),
+        }
+
+        for arp_record in arp_records or []:
+            if not isinstance(arp_record, dict):
+                continue
+
+            port_id = arp_record.get("port_id")
+            port_info = self._get_port(port_id) if port_id else None
+            record_ip = parse_ip_from_arp(arp_record)
+
+            if port_id:
+                port_id_text = str(port_id).strip()
+                context["port_ids"].add(port_id_text)
+                if record_ip and port_id_text not in context["ip_by_port_id"]:
+                    context["ip_by_port_id"][port_id_text] = record_ip
+
+            device_id = arp_record.get("device_id") or (port_info or {}).get("device_id")
+            if device_id:
+                context["device_ids"].add(str(device_id).strip())
+
+            vlan_hint = extract_vlan_from_interface_fields(arp_record)
+            if not vlan_hint and port_info:
+                vlan_hint = extract_vlan_from_interface_fields(port_info)
+            if vlan_hint:
+                context["vlans"].add(vlan_hint)
+
+            if record_ip and record_ip not in context["ips"]:
+                context["ips"].append(record_ip)
+
+            context["interfaces"].update(self._interface_names(arp_record, port_info))
+            context["records"].append({"arp": arp_record, "port": port_info})
+
+        return context
+
+    def _pick_related_ip(self, arp_context, fdb_record):
+        port_id = str(fdb_record.get("port_id") or "").strip()
+        if port_id and port_id in arp_context["ip_by_port_id"]:
+            return arp_context["ip_by_port_id"][port_id]
+
+        device_id = str(fdb_record.get("device_id") or "").strip()
+        for item in arp_context["records"]:
+            arp_record = item["arp"]
+            port_info = item["port"] or {}
+
+            if port_id and str(arp_record.get("port_id") or "").strip() == port_id:
+                return parse_ip_from_arp(arp_record)
+
+            if device_id and str(port_info.get("device_id") or arp_record.get("device_id") or "").strip() == device_id:
+                record_ip = parse_ip_from_arp(arp_record)
+                if record_ip:
+                    return record_ip
+
+        return arp_context["ips"][0] if arp_context["ips"] else ""
+
+    def _build_fdb_candidate(self, fdb_record, arp_context):
+        port_info = self._get_port(fdb_record.get("port_id"))
+        device_key = self._get_device_lookup_key(port_info, fallback_device_id=fdb_record.get("device_id"))
+        device_vlans = self._get_device_vlans_cached(device_key)
+        vlan = resolve_fdb_vlan(
+            fdb_record,
+            device_vlans=device_vlans,
+            port_info=port_info,
+            arp_record=arp_context["records"][0]["arp"] if arp_context["records"] else None,
+        )
+        score = score_fdb_candidate(
+            fdb_record,
+            preferred_port_ids=arp_context["port_ids"],
+            preferred_device_ids=arp_context["device_ids"],
+            preferred_vlans=arp_context["vlans"],
+            candidate_vlan=vlan,
         )
 
-        if fdb_record:
-            return self._resolve_fdb_result(fdb_record, fdb_detail_records)
+        if port_info:
+            port_names = self._interface_names(port_info)
+            if port_names and port_names & arp_context["interfaces"]:
+                score += 40
 
-        best = pick_best_result(fdb_detail_records) or pick_best_result(port_records)
-        vlan = extract_terminal_vlan(best)
-        return best, vlan
+        if vlan and vlan in collect_port_vlan_values(port_info):
+            score += 20
 
-    def build_result(self, q, query_type, mac, best, vlan):
-        hostname = str(
-            best.get("hostname")
-            or best.get("device_hostname")
-            or best.get("device")
-            or ""
-        )
+        related_ip = self._pick_related_ip(arp_context, fdb_record)
+
+        return {
+            "score": score,
+            "updated_at": str(fdb_record.get("updated_at") or ""),
+            "port_id": str(fdb_record.get("port_id") or ""),
+            "vlan": vlan,
+            "fdb": dict(fdb_record),
+            "port": port_info,
+            "related_ip": related_ip,
+            "arp_records": [item["arp"] for item in arp_context["records"]],
+        }
+
+    def locate_by_mac(self, mac, arp_records=None):
+        arp_context = self._collect_arp_context(arp_records or [])
+        fdb_records = lookup_fdb_by_mac(mac)
+        candidates = [self._build_fdb_candidate(item, arp_context) for item in fdb_records]
+
+        return pick_scored_candidate(candidates)
+
+    @staticmethod
+    def _device_names(port_info, fallback_record):
+        device = (port_info or {}).get("device") if isinstance(port_info, dict) else None
+        hostname = ""
+        device_name = ""
+
+        if isinstance(device, dict):
+            hostname = str(
+                device.get("hostname")
+                or device.get("sysName")
+                or device.get("display")
+                or device.get("name")
+                or ""
+            ).strip()
+            device_name = str(
+                device.get("sysName")
+                or device.get("display")
+                or device.get("name")
+                or hostname
+            ).strip()
+
+        if not hostname:
+            hostname = str(
+                (fallback_record or {}).get("hostname")
+                or (fallback_record or {}).get("device_hostname")
+                or ""
+            ).strip()
+
+        if not device_name:
+            device_name = str(
+                (fallback_record or {}).get("sysName")
+                or (fallback_record or {}).get("device_name")
+                or hostname
+            ).strip()
+
+        return hostname, device_name
+
+    def build_result(self, q, query_type, mac, candidate):
+        port_info = candidate.get("port") or {}
+        fdb_record = candidate.get("fdb") or {}
+        hostname, device_name = self._device_names(port_info, fdb_record)
 
         netbox_device = self.get_netbox_device_by_mgmt_ip(hostname)
+        display_ip = q if query_type == "ip" else candidate.get("related_ip", "")
+        interface = str(
+            port_info.get("ifName")
+            or port_info.get("ifDescr")
+            or port_info.get("ifAlias")
+            or fdb_record.get("ifName")
+            or fdb_record.get("port")
+            or ""
+        ).strip()
+        raw = {
+            "score": candidate.get("score"),
+            "related_ip": candidate.get("related_ip"),
+            "fdb": fdb_record,
+            "port": port_info,
+            "arp_records": candidate.get("arp_records", []),
+        }
 
         return {
             "query": q,
             "query_type": query_type,
             "mac": mac,
+            "ip": display_ip,
             "hostname": hostname,
-            "device_name": best.get("sysName") or best.get("device_name") or hostname,
-            "interface": best.get("ifName") or best.get("port_label") or best.get("port") or "",
-            "vlan": vlan,
+            "device_name": device_name,
+            "interface": interface,
+            "vlan": candidate.get("vlan", ""),
             "netbox_device": netbox_device,
-            "raw": best,
-            "raw_pretty": self._pretty_json(best),
+            "raw": raw,
+            "raw_pretty": self._pretty_json(raw),
         }
 
     @staticmethod
@@ -234,6 +294,9 @@ class EndpointLookupView(View):
             return str(obj)
 
     def get(self, request):
+        self._port_cache = {}
+        self._device_vlan_cache = {}
+
         form = EndpointLookupForm(request.GET or None)
         context = {
             "form": form,
@@ -256,44 +319,23 @@ class EndpointLookupView(View):
                     context["error"] = f"未在 LibreNMS ARP 中找到 {q}"
                     return render(request, self.template_name, context)
 
-                preferred_device_id = arp_record.get("device_id") if arp_record else None
-                preferred_vlan = extract_vlan_from_interface_fields(arp_record)
+                candidate = self.locate_by_mac(mac, arp_records=[arp_record] if arp_record else [])
 
-                if arp_record and arp_record.get("port_id"):
-                    arp_port = lookup_port_by_id(
-                        arp_record.get("port_id"),
-                        with_relations=["device"],
-                    )
-                    if arp_port:
-                        preferred_device_id = preferred_device_id or arp_port.get("device_id")
-                        preferred_vlan = preferred_vlan or extract_vlan_from_interface_fields(arp_port)
-
-                preferred_device = self._get_device_lookup_key(
-                    arp_port if arp_record and arp_record.get("port_id") else arp_record,
-                    fallback_device_id=preferred_device_id,
-                )
-                best, vlan = self.locate_by_mac(
-                    mac,
-                    preferred_device=preferred_device,
-                    preferred_device_id=preferred_device_id,
-                    preferred_vlan=preferred_vlan,
-                )
-
-                if not best:
+                if not candidate:
                     context["error"] = f"找到了 MAC {mac}，但未在 FDB/端口表中定位到交换机接口"
                     return render(request, self.template_name, context)
 
-                context["result"] = self.build_result(q, "ip", mac, best, vlan)
+                context["result"] = self.build_result(q, "ip", mac, candidate)
                 return render(request, self.template_name, context)
 
             mac = normalize_mac(q)
-            best, vlan = self.locate_by_mac(mac)
+            candidate = self.locate_by_mac(mac, arp_records=lookup_arp_by_mac(mac))
 
-            if not best:
+            if not candidate:
                 context["error"] = f"未在 LibreNMS FDB/端口表中找到 MAC {mac}"
                 return render(request, self.template_name, context)
 
-            context["result"] = self.build_result(q, "mac", mac, best, vlan)
+            context["result"] = self.build_result(q, "mac", mac, candidate)
             return render(request, self.template_name, context)
 
         except Exception as exc:
