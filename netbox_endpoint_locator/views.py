@@ -13,6 +13,8 @@ from .librenms import (
     normalize_mac,
     lookup_arp_by_mac,
     lookup_arp_by_ip,
+    lookup_device_links,
+    lookup_device_port_stack,
     lookup_device_vlans,
     lookup_fdb_by_mac,
     lookup_fdb_detail_by_mac,
@@ -24,6 +26,7 @@ from .librenms import (
     resolve_fdb_vlan,
     score_fdb_candidate,
 )
+from .topology import build_port_stack_members, candidate_id, pick_edge_candidate
 
 
 class EndpointLookupView(View):
@@ -48,11 +51,11 @@ class EndpointLookupView(View):
         return Device.objects.filter(primary_ip4=ip_obj).first()
 
     @staticmethod
-    def _get_device_lookup_key(port_info, fallback_device_id=None):
+    def _get_device_lookup_key(port_info, *fallback_records):
         if isinstance(port_info, dict):
             device = port_info.get("device")
             if isinstance(device, dict):
-                for key in ("hostname", "sysName", "display", "name"):
+                for key in ("hostname", "device_id", "sysName", "display", "name"):
                     value = device.get(key)
                     if value:
                         return str(value).strip()
@@ -62,8 +65,16 @@ class EndpointLookupView(View):
                 if value:
                     return str(value).strip()
 
-        if fallback_device_id:
-            return str(fallback_device_id).strip()
+        for record in fallback_records:
+            if not isinstance(record, dict):
+                if record:
+                    return str(record).strip()
+                continue
+
+            for key in ("hostname", "device_hostname", "device_id"):
+                value = record.get(key)
+                if value:
+                    return str(value).strip()
 
         return None
 
@@ -89,6 +100,28 @@ class EndpointLookupView(View):
             self._device_vlan_cache[cache_key] = lookup_device_vlans(device_key)
 
         return self._device_vlan_cache[cache_key]
+
+    def _get_device_links_cached(self, device_key, cache_key=None):
+        lookup_key = str(device_key).strip() if device_key else ""
+        cache_token = str(cache_key or lookup_key).strip()
+        if not cache_token or not lookup_key:
+            return []
+
+        if cache_token not in self._device_link_cache:
+            self._device_link_cache[cache_token] = lookup_device_links(lookup_key)
+
+        return self._device_link_cache[cache_token]
+
+    def _get_device_port_stack_cached(self, device_key, cache_key=None):
+        lookup_key = str(device_key).strip() if device_key else ""
+        cache_token = str(cache_key or lookup_key).strip()
+        if not cache_token or not lookup_key:
+            return []
+
+        if cache_token not in self._device_port_stack_cache:
+            self._device_port_stack_cache[cache_token] = lookup_device_port_stack(lookup_key)
+
+        return self._device_port_stack_cache[cache_token]
 
     @staticmethod
     def _interface_names(*records):
@@ -217,9 +250,9 @@ class EndpointLookupView(View):
 
     def _build_fdb_candidate(self, fdb_record, arp_context, fdb_detail_records):
         port_info = self._get_port(fdb_record.get("port_id"))
-        device_key = self._get_device_lookup_key(port_info, fallback_device_id=fdb_record.get("device_id"))
-        device_vlans = self._get_device_vlans_cached(device_key)
         detail_record = self._pick_matching_detail_record(fdb_detail_records, fdb_record, port_info)
+        device_key = self._get_device_lookup_key(port_info, fdb_record, detail_record)
+        device_vlans = self._get_device_vlans_cached(device_key)
         vlan = resolve_fdb_vlan(
             fdb_record,
             device_vlans=device_vlans,
@@ -243,11 +276,47 @@ class EndpointLookupView(View):
             score += 20
 
         related_ip = self._pick_related_ip(arp_context, fdb_record)
+        hostname, device_name = self._device_names(port_info, fdb_record, detail_record=detail_record)
+        interface = str(
+            (port_info or {}).get("ifName")
+            or (port_info or {}).get("ifDescr")
+            or (port_info or {}).get("ifAlias")
+            or (detail_record or {}).get("ifName")
+            or (detail_record or {}).get("ifDescr")
+            or (detail_record or {}).get("ifAlias")
+            or fdb_record.get("ifName")
+            or fdb_record.get("port")
+            or ""
+        ).strip()
+        description = str(
+            (port_info or {}).get("ifAlias")
+            or (detail_record or {}).get("ifAlias")
+            or (detail_record or {}).get("ifDescr")
+            or fdb_record.get("description")
+            or fdb_record.get("port_descr")
+            or ""
+        ).strip()
+        device_id = str(
+            fdb_record.get("device_id")
+            or (port_info or {}).get("device_id")
+            or (((port_info or {}).get("device") or {}).get("device_id") if isinstance((port_info or {}).get("device"), dict) else "")
+            or (detail_record or {}).get("device_id")
+            or ""
+        ).strip()
+        port_id = str(fdb_record.get("port_id") or "").strip()
+        candidate_token = f"{device_id}:{port_id}" if device_id and port_id else port_id
 
         return {
+            "candidate_id": candidate_token,
             "score": score,
             "updated_at": str(fdb_record.get("updated_at") or ""),
-            "port_id": str(fdb_record.get("port_id") or ""),
+            "device_id": device_id,
+            "device_key": str(device_key or device_id or "").strip(),
+            "hostname": hostname,
+            "device_name": device_name,
+            "interface": interface,
+            "description": description,
+            "port_id": port_id,
             "vlan": vlan,
             "fdb": dict(fdb_record),
             "port": port_info,
@@ -256,13 +325,102 @@ class EndpointLookupView(View):
             "arp_records": [item["arp"] for item in arp_context["records"]],
         }
 
+    @staticmethod
+    def _candidate_summary(candidate):
+        if not isinstance(candidate, dict):
+            return {}
+
+        return {
+            "candidate_id": str(candidate.get("candidate_id") or ""),
+            "device_id": str(candidate.get("device_id") or ""),
+            "device_key": str(candidate.get("device_key") or ""),
+            "hostname": str(candidate.get("hostname") or ""),
+            "device_name": str(candidate.get("device_name") or ""),
+            "interface": str(candidate.get("interface") or ""),
+            "description": str(candidate.get("description") or ""),
+            "port_id": str(candidate.get("port_id") or ""),
+            "vlan": str(candidate.get("vlan") or ""),
+            "related_ip": str(candidate.get("related_ip") or ""),
+            "score": candidate.get("score"),
+            "updated_at": str(candidate.get("updated_at") or ""),
+        }
+
+    def _build_topology_context(self, canonical_candidate, candidates):
+        if not canonical_candidate:
+            return {
+                "selected": None,
+                "graph": {},
+                "path": [],
+                "scores": {},
+                "candidates": [],
+                "links_by_device": {},
+                "stack_members_by_device": {},
+            }
+
+        links_by_device = {}
+        stack_members_by_device = {}
+
+        for candidate in candidates:
+            device_id = str(candidate.get("device_id") or "").strip()
+            device_key = str(candidate.get("device_key") or device_id).strip()
+            if not device_id or not device_key:
+                continue
+
+            if device_id not in links_by_device:
+                links_by_device[device_id] = self._get_device_links_cached(device_key, cache_key=device_id)
+
+            if device_id not in stack_members_by_device:
+                stack_records = self._get_device_port_stack_cached(device_key, cache_key=device_id)
+                stack_members_by_device[device_id] = build_port_stack_members(stack_records)
+
+        selection = pick_edge_candidate(
+            canonical_candidate,
+            candidates,
+            links_by_device,
+            stack_members_by_device,
+        )
+
+        return {
+            "selected": selection.get("selected"),
+            "graph": {
+                node_id: sorted(neighbors)
+                for node_id, neighbors in (selection.get("graph") or {}).items()
+            },
+            "path": list(selection.get("path") or []),
+            "scores": dict(selection.get("scores") or {}),
+            "candidates": list(selection.get("candidates") or []),
+            "links_by_device": links_by_device,
+            "stack_members_by_device": {
+                device_id: {
+                    port_id: sorted(member_ids)
+                    for port_id, member_ids in port_map.items()
+                }
+                for device_id, port_map in stack_members_by_device.items()
+            },
+        }
+
+    def _candidate_path_summary(self, path_ids, candidates):
+        by_id = {candidate_id(item): item for item in candidates if isinstance(item, dict)}
+        return [
+            self._candidate_summary(by_id[node_id])
+            for node_id in path_ids or []
+            if node_id in by_id
+        ]
+
     def locate_by_mac(self, mac, arp_records=None):
         arp_context = self._collect_arp_context(arp_records or [])
         fdb_records = lookup_fdb_by_mac(mac)
         fdb_detail_records = lookup_fdb_detail_by_mac(mac)
         candidates = [self._build_fdb_candidate(item, arp_context, fdb_detail_records) for item in fdb_records]
+        canonical_candidate = pick_scored_candidate(candidates)
+        topology = self._build_topology_context(canonical_candidate, candidates)
 
-        return pick_scored_candidate(candidates)
+        return {
+            "canonical": canonical_candidate,
+            "edge": topology.get("selected") or canonical_candidate,
+            "candidates": candidates,
+            "topology": topology,
+        }
 
     @staticmethod
     def _device_names(port_info, fallback_record, detail_record=None):
@@ -303,32 +461,66 @@ class EndpointLookupView(View):
 
         return hostname, device_name
 
-    def build_result(self, q, query_type, mac, candidate):
-        port_info = candidate.get("port") or {}
-        fdb_record = candidate.get("fdb") or {}
-        detail_record = candidate.get("detail") or {}
-        hostname, device_name = self._device_names(port_info, fdb_record, detail_record=detail_record)
+    def build_result(self, q, query_type, mac, localization):
+        canonical_candidate = (localization or {}).get("canonical") or {}
+        display_candidate = (localization or {}).get("edge") or canonical_candidate
+        topology = (localization or {}).get("topology") or {}
+        all_candidates = (localization or {}).get("candidates") or []
 
-        netbox_device = self.get_netbox_device_by_mgmt_ip(hostname)
-        display_ip = q if query_type == "ip" else candidate.get("related_ip", "")
-        interface = str(
-            port_info.get("ifName")
-            or port_info.get("ifDescr")
-            or port_info.get("ifAlias")
-            or detail_record.get("ifName")
-            or detail_record.get("ifDescr")
-            or detail_record.get("ifAlias")
-            or fdb_record.get("ifName")
-            or fdb_record.get("port")
+        canonical_port = canonical_candidate.get("port") or {}
+        canonical_fdb = canonical_candidate.get("fdb") or {}
+        canonical_detail = canonical_candidate.get("detail") or {}
+        display_port = display_candidate.get("port") or {}
+        display_fdb = display_candidate.get("fdb") or {}
+        display_detail = display_candidate.get("detail") or {}
+
+        hostname = str(
+            display_candidate.get("hostname")
+            or canonical_candidate.get("hostname")
             or ""
         ).strip()
+        device_name = str(
+            display_candidate.get("device_name")
+            or canonical_candidate.get("device_name")
+            or hostname
+        ).strip()
+        interface = str(
+            display_candidate.get("interface")
+            or canonical_candidate.get("interface")
+            or ""
+        ).strip()
+        netbox_device = self.get_netbox_device_by_mgmt_ip(hostname)
+        display_ip = q if query_type == "ip" else canonical_candidate.get("related_ip", "")
+        selected_candidate_id = candidate_id(display_candidate) if display_candidate else ""
+        canonical_candidate_id = candidate_id(canonical_candidate) if canonical_candidate else ""
         raw = {
-            "score": candidate.get("score"),
-            "related_ip": candidate.get("related_ip"),
-            "fdb": fdb_record,
-            "port": port_info,
-            "detail": detail_record,
-            "arp_records": candidate.get("arp_records", []),
+            "canonical_result": self._candidate_summary(canonical_candidate),
+            "edge_localized_result": self._candidate_summary(display_candidate),
+            "display_overridden": bool(
+                canonical_candidate_id
+                and selected_candidate_id
+                and canonical_candidate_id != selected_candidate_id
+            ),
+            "topology": {
+                "canonical_candidate_id": canonical_candidate_id,
+                "selected_candidate_id": selected_candidate_id,
+                "path": self._candidate_path_summary(topology.get("path", []), all_candidates),
+                "scores": topology.get("scores", {}),
+                "graph": topology.get("graph", {}),
+                "stack_members_by_device": topology.get("stack_members_by_device", {}),
+            },
+            "candidates": [self._candidate_summary(item) for item in all_candidates],
+            "canonical_evidence": {
+                "fdb": canonical_fdb,
+                "port": canonical_port,
+                "detail": canonical_detail,
+                "arp_records": canonical_candidate.get("arp_records", []),
+            },
+            "display_evidence": {
+                "fdb": display_fdb,
+                "port": display_port,
+                "detail": display_detail,
+            },
         }
 
         return {
@@ -339,7 +531,7 @@ class EndpointLookupView(View):
             "hostname": hostname,
             "device_name": device_name,
             "interface": interface,
-            "vlan": candidate.get("vlan", ""),
+            "vlan": canonical_candidate.get("vlan", ""),
             "netbox_device": netbox_device,
             "raw": raw,
             "raw_pretty": self._pretty_json(raw),
@@ -355,6 +547,8 @@ class EndpointLookupView(View):
     def get(self, request):
         self._port_cache = {}
         self._device_vlan_cache = {}
+        self._device_link_cache = {}
+        self._device_port_stack_cache = {}
 
         form = EndpointLookupForm(request.GET or None)
         context = {
@@ -378,23 +572,23 @@ class EndpointLookupView(View):
                     context["error"] = f"未在 LibreNMS ARP 中找到 {q}"
                     return render(request, self.template_name, context)
 
-                candidate = self.locate_by_mac(mac, arp_records=[arp_record] if arp_record else [])
+                localization = self.locate_by_mac(mac, arp_records=[arp_record] if arp_record else [])
 
-                if not candidate:
+                if not localization or not localization.get("canonical"):
                     context["error"] = f"找到了 MAC {mac}，但未在 FDB/端口表中定位到交换机接口"
                     return render(request, self.template_name, context)
 
-                context["result"] = self.build_result(q, "ip", mac, candidate)
+                context["result"] = self.build_result(q, "ip", mac, localization)
                 return render(request, self.template_name, context)
 
             mac = normalize_mac(q)
-            candidate = self.locate_by_mac(mac, arp_records=lookup_arp_by_mac(mac))
+            localization = self.locate_by_mac(mac, arp_records=lookup_arp_by_mac(mac))
 
-            if not candidate:
+            if not localization or not localization.get("canonical"):
                 context["error"] = f"未在 LibreNMS FDB/端口表中找到 MAC {mac}"
                 return render(request, self.template_name, context)
 
-            context["result"] = self.build_result(q, "mac", mac, candidate)
+            context["result"] = self.build_result(q, "mac", mac, localization)
             return render(request, self.template_name, context)
 
         except Exception as exc:

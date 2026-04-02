@@ -1,122 +1,46 @@
-# NetBox Endpoint Locator（LibreNMS 端口定位插件）
+# NetBox Endpoint Locator（LibreNMS 终端定位插件）
 
-通过查询 LibreNMS 的 ARP / FDB / 端口相关 API，在 NetBox 中为给定的 **IP 或 MAC** 找到对应的 **接入交换机/接口**，并尽可能关联到 NetBox 里的 `Device`。
+这是一个基于 LibreNMS API 的 NetBox 插件，用来按 `IP` 或 `MAC` 查询终端所在的交换机、接口、VLAN，以及关联的 IPv4 信息。
 
-英文首页入口：[README.md](./README.md)
+当前文档对应版本：`0.4.0`
 
----
-
-## 功能概览
-
-- 输入 `IPv4` 或 `MAC`
-- 查询链路：`IP -> ARP -> MAC -> FDB/端口`
-- 输出：交换机/设备名、接口、VLAN（仅显示 LibreNMS 采集到的终端 VLAN）
-- 可根据“管理 IP”匹配到 NetBox 中的 `Device`
-- 集成到 NetBox 插件菜单
+英文首页入口：[`README.md`](./README.md)
 
 ---
 
-## 架构说明
+## 1. 功能概览
 
-### 1) 组件划分
+- 支持输入 `IPv4` 或 `MAC`
+- 查询结果尽量与 LibreNMS Web 前端保持一致
+- 显示：
+  - MAC
+  - 关联 IPv4
+  - LibreNMS 主机
+  - 交换机/设备名
+  - 接口
+  - VLAN
+  - NetBox 设备匹配结果
+- 页面支持展开“原始返回”查看 API 原始数据，便于排错
 
-- `netbox_endpoint_locator/__init__.py`
-  - 负责 `PluginConfig` 注册（**必须在此文件中定义**，NetBox 才能正确解析默认的 `navigation.menu` / `navigation.menu_items` 路径）、`PLUGINS_CONFIG` 必填项、base_url 等
-- `netbox_endpoint_locator/navigation.py`
-  - 定义插件菜单项 `Endpoint Locator -> Lookup`
-- `netbox_endpoint_locator/urls.py`
-  - 映射路由到视图：`lookup/`
-- `netbox_endpoint_locator/views.py`
-  - 处理请求：解析表单输入（IP/MAC）、调用 LibreNMS 查询逻辑、组装结果并渲染模板
-- `netbox_endpoint_locator/forms.py`
-  - 定义输入表单（`q`：IP 或 MAC）
-- `netbox_endpoint_locator/librenms.py`
-  - 封装 LibreNMS API 请求与结果处理逻辑（包括 IP/MAC 判断、MAC 归一化、结果优选）
-- `netbox_endpoint_locator/templates/netbox_endpoint_locator/lookup.html`
-  - 页面展示查询表单与结果（包含原始返回的 JSON 预览）
-
-### 2) 数据流（Data Flow）
-
-```text
-用户在 NetBox UI 输入 IP/MAC
-        |
-        v
-views.py 解析 q 的类型
-  - IP: 调用 lookup_arp_by_ip
-        从 ARP 记录中提取 MAC
-        并根据 ARP 返回的 port_id 补查 lookup_port_by_id
-        锁定当前 IP 所在的设备上下文 / SVI VLAN
-        再调用 lookup_fdb_by_mac 精确匹配同设备的 FDB 记录
-        最后调用 lookup_port_by_id 回填 FDB 命中端口的接口名
-        若 FDB 无结果，再调用 lookup_fdb_detail_by_mac / lookup_port_by_mac 兜底
-  - MAC: 直接调用 lookup_fdb_detail_by_mac
-        并补查 lookup_fdb_by_mac 作为 VLAN 真值来源
-        再调用 lookup_port_by_id 回填命中端口的接口名
-        若 FDB 无结果，再调用 lookup_port_by_mac
-        |
-        v
-librenms.py 返回“候选结果列表”
-        |
-        v
-views.py 使用 pick_best_result 选择最佳候选
-        |
-        v
-views.py 尝试按“管理 IP”匹配 NetBox Device
-        |
-        v
-渲染 lookup.html 展示接口/VLAN/设备信息
-```
+从 `0.4.0` 开始，插件除了保持 `IP / MAC / VLAN` 的闭环正确性之外，还会额外尝试把展示位置收敛到“最靠近终端接入层”的交换机和接口，而不是停留在核心或汇聚设备的聚合口上。
 
 ---
 
-## LibreNMS API 前置条件
+## 2. 适用环境
 
-你需要确保 LibreNMS 已经能通过 API 返回以下数据（并且数据字段能被插件代码正确解析）：
+- NetBox：建议 `4.4.x`
+- 插件声明最小版本：`4.0.0`
+- Python：`>= 3.10`
 
-- ARP：
-  - `/api/v0/resources/ip/arp/<ip>`
-- FDB：
-  - `/api/v0/resources/fdb/<mac>`
-  - `/api/v0/resources/fdb/<mac>/detail`
-- 端口（按 MAC 查询）：
-  - `/api/v0/ports/mac/<mac>?filter=first`
-
-如果查询返回“找不到接口”，通常原因包括：
-
-- LibreNMS 尚未采集/同步该终端相关的 ARP/FDB/端口数据
-- LibreNMS 返回字段结构与插件的 key 假设不一致（不同版本可能字段名不同）
+如果你的 NetBox 不是 `4.4.x`，也可以使用，但建议先在测试环境验证。
 
 ---
 
-## 配置项（NetBox）
+## 3. 安装插件
 
-在你的 NetBox 配置中设置：
+### 3.1 首次安装
 
-```python
-PLUGINS = ["netbox_endpoint_locator"]
-
-PLUGINS_CONFIG = {
-    "netbox_endpoint_locator": {
-        "librenms_url": "https://librenms.example.com",
-        "librenms_token": "YOUR_TOKEN",
-
-        # 可选
-        "verify_ssl": False,   # LibreNMS 使用自签证书时常见
-        "timeout": 15,         # 请求超时时间（秒）
-        "top_level_menu": False,
-    }
-}
-```
-
-插件在缺少必填项时会在请求阶段给出清晰的错误信息（避免 import 阶段直接导致插件整体不可用）。
-
----
-
-## 安装与启用（面向用户）
-
-假设你的 NetBox 是在同一套 Python 环境中运行（在该环境里使用 `pip` 安装即可）。
-
-1. 克隆仓库并安装插件
+请在 **NetBox 使用的同一个 Python 环境** 中安装：
 
 ```bash
 git clone https://github.com/Jaycelu/netbox_-endpoint_locator.git
@@ -124,41 +48,33 @@ cd netbox_-endpoint_locator
 pip install -e .
 ```
 
-2. 在 NetBox 启用插件并填写 `PLUGINS_CONFIG`
+### 3.2 升级到最新版
 
-参照上面的“配置项（NetBox）”。
-
-3. 重启 NetBox
-
-示例：
+如果你已经装过旧版本，可以这样升级：
 
 ```bash
-systemctl restart netbox
+cd netbox_-endpoint_locator
+git pull
+pip install -e .
 ```
 
-4. 使用插件
-
-- 登录 NetBox UI
-- 在菜单中进入：`Endpoint Locator` -> `Lookup`
-- 输入 IP 或 MAC 即可查询
+如果你使用的是虚拟环境，请先激活 NetBox 对应的虚拟环境后再执行以上命令。
 
 ---
 
-## 配置指南
+## 4. 在 NetBox 中启用插件
 
-先在 NetBox 的 `configuration.py` 中启用插件：
+编辑 NetBox 的 `configuration.py`：
 
 ```python
 PLUGINS = ["netbox_endpoint_locator"]
-```
 
-然后配置 LibreNMS 访问参数：
-
-```python
 PLUGINS_CONFIG = {
     "netbox_endpoint_locator": {
         "librenms_url": "https://librenms.example.com",
         "librenms_token": "YOUR_TOKEN",
+
+        # 可选项
         "verify_ssl": False,
         "timeout": 15,
         "top_level_menu": False,
@@ -166,107 +82,250 @@ PLUGINS_CONFIG = {
 }
 ```
 
-必填项：
+### 必填项
 
 - `librenms_url`
 - `librenms_token`
 
-可选项：
+### 可选项
 
 - `verify_ssl`
+  - LibreNMS 使用自签证书时常见
 - `timeout`
+  - API 请求超时时间，单位秒
 - `top_level_menu`
+  - 是否放到顶层菜单
 
-### 配置完成后
-
-- 修改完 `configuration.py` 后，重启 NetBox 服务
-- 插件页面只会走 LibreNMS 查询，不需要再配置其他 provider
-- 如果需要匹配到 NetBox 设备，请确保 LibreNMS 返回的设备管理 IP 能和 NetBox 设备的 `primary_ip4` 对应上
+插件缺少必填项时，会在请求阶段给出明确错误，而不是在 NetBox 启动时直接崩掉。
 
 ---
 
-## 插件实时查询会调用哪些 LibreNMS API
+## 5. 重启 NetBox
 
-这个插件本身只做“按需实时查询”，不会自己触发 LibreNMS 做全量更新，也不会去拉整库设备列表。
+改完配置或升级插件后，需要重启 NetBox 服务。
 
-### 1. 输入 IP 时
+常见 systemd 示例：
 
-查询链路是：
+```bash
+sudo systemctl restart netbox netbox-rq
+```
 
-`IP -> ARP -> MAC -> FDB -> 端口`
+如果你使用 Docker、Gunicorn、uWSGI 或其他部署方式，请重启对应的 Web / worker 进程。
 
-具体会调用这些 API：
+---
 
-- `GET /api/v0/resources/ip/arp/<ip>`
-  - 作用：先把 IP 解析成 MAC，并保留这条 ARP 所在的 `port_id`
+## 6. 使用方法
+
+1. 登录 NetBox
+2. 打开菜单：`Endpoint Locator -> Lookup`
+3. 输入一个 IPv4 地址或 MAC 地址
+4. 查看查询结果
+
+支持的 MAC 输入形式包括：
+
+- `9ce89518ffd6`
+- `9c:e8:95:18:ff:d6`
+- `9c-e8-95-18-ff-d6`
+- `9ce8.9518.ffd6`
+
+---
+
+## 7. 0.4.0 之后的查询逻辑
+
+这是这次文档里最重要的部分，因为它解释了为什么现在结果更准确。
+
+### 7.1 设计原则
+
+插件现在优先围绕 **同一条 LibreNMS FDB 记录** 完成闭环关联，而不是把多个 API 返回中“看起来像对的字段”拼成一个结果。
+
+换句话说，最终展示的：
+
+- 交换机/设备
+- 接口
+- VLAN
+- 关联 IP
+
+会尽量来自同一条命中的 `FDB + Port` 关联链路。
+
+### 7.2 输入 IP 时
+
+查询主线：
+
+`IP -> ARP -> MAC -> FDB -> Port -> VLAN`
+
+具体过程：
+
+1. 先查 `ARP`
+2. 从 ARP 中拿到：
+   - `mac_address`
+   - `port_id`
+3. 再按 MAC 查 `FDB`
+4. 用 ARP 的 `port_id / device / 接口线索 / VLAN 线索` 给 FDB 候选打分
+5. 选中最可信的一条 FDB 记录
+6. 再按这条 FDB 的 `port_id` 读取端口详情和设备关系
+7. 最后解析真实 VLAN 并展示
+
+### 7.3 输入 MAC 时
+
+查询主线：
+
+`MAC -> ARP -> FDB -> Port -> VLAN`
+
+具体过程：
+
+1. 先按 MAC 查 `ARP`
+2. 再按 MAC 查 `FDB`
+3. 用 ARP 返回的端口/设备/IP 作为上下文
+4. 对 FDB 候选排序
+5. 再补端口详情和设备名
+
+这就是为什么现在 `MAC 反查 IP`、`IP 反查 MAC`、`VLAN`、`接口` 能更一致。
+
+---
+
+## 8. 插件实际调用的 LibreNMS API
+
+插件只做“实时按需查询”，不会自己做全量同步。
+
+### 8.1 核心接口
+
+- `GET /api/v0/resources/ip/arp/<ip-or-mac>`
+  - 查询 ARP
+  - 既可以按 IP 查，也可以按 MAC 查
+
+- `GET /api/v0/resources/fdb/<mac>`
+  - 查询某个 MAC 的 FDB 记录
+
+- `GET /api/v0/resources/fdb/<mac>/detail`
+  - 查询可读化的 FDB 详情
+  - 主要用来补设备名、接口名
+
 - `GET /api/v0/ports/<port_id>?with=device`
-  - 作用：拿到 ARP 命中接口所属设备，用它锁定“当前这台设备”的 FDB 上下文
-- `GET /api/v0/resources/fdb/<mac>`
-  - 作用：按同设备上下文精确匹配这条 MAC 的 `vlan_id` 与命中端口
-- `GET /api/v0/ports/<fdb_port_id>?with=device`
-  - 作用：把 FDB 命中的 `port_id` 回填成最终展示的接口名/设备名
-- `GET /api/v0/resources/fdb/<mac>/detail`
-  - 作用：只在需要时补充更友好的设备名、接口名
-- `GET /api/v0/ports/mac/<mac>?filter=first`
-  - 作用：如果 FDB 没法定位，再做兜底端口查询
+  - 查询端口所属设备
 
-### 2. 输入 MAC 时
+- `GET /api/v0/ports/<port_id>?with=vlans`
+  - 查询端口的 VLAN 关联
 
-具体会调用这些 API：
+- `GET /api/v0/resources/vlans?hostname=<device>`
+  - 用来把 FDB 的内部 `vlan_id` 映射成可读的真实 VLAN 号
 
-- `GET /api/v0/resources/fdb/<mac>/detail`
-- `GET /api/v0/resources/fdb/<mac>`
-- `GET /api/v0/ports/mac/<mac>?filter=first`
+### 8.2 为什么不再依赖 `ports/mac` 作为真相来源
 
-### 3. 没有调用的部分
+早期版本容易把：
 
-当前插件**没有**调用这些类型的接口：
+- `ARP`
+- `FDB`
+- `FDB detail`
+- `ports/mac`
 
-- 设备全量列表
-- 端口全量列表
-- 性能图表 / 监控指标
-- 告警 / 事件日志
-- 配置下发或写入类 API
+的字段混在一起用。
 
-所以如果你要对 LibreNMS 的策略做瘦身，插件侧真正依赖的只有这几类数据：
+但 LibreNMS 的 `ports/mac/:search?filter=first` 更像是“候选端口搜索结果”，并不适合直接当最终真相来源。  
+现在插件会把它从主逻辑中降级，避免出现：
 
-- ARP 表
-- FDB / MAC 地址表
-- MAC 到端口的关联结果
-- 设备管理 IP 到设备名的返回字段
-
-换句话说，你不需要为了这个插件去做“全量 API 拉取”，但 LibreNMS 本身仍然要能正常采集到终端对应的 ARP、FDB 和端口数据，否则插件查的时候就没有现成数据可用。
+- `IP 查出来接口 A`
+- `MAC 反查却跳到接口 B`
+- VLAN 也跟着错
 
 ---
 
-## 兼容性与版本建议
+## 9. NetBox 设备匹配规则
 
-- 目标：NetBox `4.4.x`
-- 插件在 `__init__.py` 的 `PluginConfig` 中声明 `min_version = 4.0.0`
-- 但实际建议以你运行的具体版本进行验证
+插件会尝试把 LibreNMS 返回的管理地址匹配到 NetBox 的 `Device.primary_ip4`。
 
-你当前 NetBox 是 `v4.4.10`：建议优先按该版本验证。
+所以如果你希望页面里能看到“NetBox 设备”链接，需要保证：
+
+- LibreNMS 返回的是设备管理 IP 或可映射到管理 IP 的 hostname
+- NetBox 对应设备设置了正确的 `primary_ip4`
+
+如果页面显示“未匹配”，通常说明两边引用的管理地址并不是同一个值。
 
 ---
 
-## 常见问题（Troubleshooting）
+## 10. 常见问题
 
-1. 页面提示“未配置 PLUGINS_CONFIG / 缺少 librenms_url 或 librenms_token”
-   - 检查 NetBox 的 `PLUGINS_CONFIG['netbox_endpoint_locator']` 是否已填写
+### 10.1 查到了接口，但“交换机/设备”为空
 
-2. 查到了 MAC，但无法定位到交换机接口
-   - 通常是 LibreNMS FDB/端口数据中没有候选，或字段结构无法被插件优选逻辑命中
-   - 可以在页面的“原始返回”中查看 `raw` / `raw_pretty`（页面会展示 JSON）
+常见原因：
 
-3. 查到了接口，但 VLAN 为空
-   - LibreNMS 的 `/api/v0/resources/fdb/<mac>/detail` 常见只返回“设备/接口”这类可读字段，不一定包含 `vlan_id`
-   - 插件现在会额外查询 `/api/v0/resources/fdb/<mac>` 以及端口结果中的 `ifVlan` 来补提终端 VLAN
-   - 若页面仍为空，通常说明 LibreNMS 当前确实没有采集到该终端的 VLAN 信息
+- LibreNMS 对该端口没有返回 `device` 关系
+- 只有 FDB 记录，没有完整设备信息
 
-4. 匹配不到 NetBox Device（“未匹配”）
-   - 插件会尝试用“管理 IP”匹配 `primary_ip4`
-   - 确保 NetBox 设备的 `primary_ip4` 与 LibreNMS 的 `hostname`/管理 IP 关联方式一致
+插件现在会优先用端口 `device` 关系，再用 `fdb/detail` 兜底补名字。
 
-5. 能通过 `/plugins/endpoint-locator/lookup/` 打开页面，但左侧主导航没有 “Endpoint Locator”
-   - 若 `PluginConfig` 写在单独的 `plugin.py` 里，NetBox 会按 `netbox_endpoint_locator.plugin.navigation` 去找 `navigation.py`，路径错误会导致**菜单永远不注册**（URL 仍可能正常）。
-   - 本仓库已改为在包根目录的 `__init__.py` 中定义 `PluginConfig`（与官方 Diode 插件一致）。更新代码后请**重启 NetBox**。
+### 10.2 VLAN 为空
+
+这是刻意设计的保守行为，不一定是 bug。
+
+如果 LibreNMS 能返回 FDB 记录，但无法把内部 `vlan_id` 映射成真实 VLAN 号，插件现在会优先留空，而不是错误显示成默认 VLAN `1`。
+
+这样虽然少了一些“猜测结果”，但不会误导你。
+
+### 10.3 MAC 能查到接口，但查不到关联 IP
+
+常见原因：
+
+- LibreNMS 当前没有这条 MAC 的 ARP 数据
+- FDB 还在，但 ARP 已经过期
+
+这种情况下插件仍然可以定位交换机和接口，但“关联 IPv4”可能为空。
+
+### 10.4 查不到 NetBox 设备
+
+请检查：
+
+- NetBox 设备是否设置了 `primary_ip4`
+- 这个 `primary_ip4` 是否就是 LibreNMS 管理地址
+- LibreNMS 返回的 hostname 是否真的是管理地址
+
+### 10.5 页面能打开，但菜单里没有 `Endpoint Locator`
+
+升级代码后请确认：
+
+- 插件已加入 `PLUGINS`
+- `configuration.py` 已生效
+- NetBox 服务已重启
+
+---
+
+## 11. 排错建议
+
+如果你发现某条数据和 LibreNMS Web 前端仍然对不上，最有效的方式是：
+
+1. 在插件页面展开“原始返回”
+2. 把同一个终端在 LibreNMS Web 的：
+   - ARP Table
+   - FDB Table
+   - Ports
+3. 三者对照起来看
+
+通常只要拿到这两边的原始数据，就能很快看出是：
+
+- LibreNMS 数据本身不同步
+- 某台设备没有 VLAN 映射
+- 某条 ARP 已经过期
+- 某个字段名称和预期不一致
+
+---
+
+## 12. 仓库内关键文件
+
+- [`netbox_endpoint_locator/__init__.py`](./netbox_endpoint_locator/__init__.py)
+  - 插件配置入口，版本号、基础元信息都在这里
+- [`netbox_endpoint_locator/librenms.py`](./netbox_endpoint_locator/librenms.py)
+  - LibreNMS API 封装与查询优选逻辑
+- [`netbox_endpoint_locator/views.py`](./netbox_endpoint_locator/views.py)
+  - 页面请求处理与结果组装
+- [`netbox_endpoint_locator/templates/netbox_endpoint_locator/lookup.html`](./netbox_endpoint_locator/templates/netbox_endpoint_locator/lookup.html)
+  - 查询页面模板
+
+---
+
+如果你后面还想补：
+
+- 批量查询
+- 候选结果列表
+- 结果导出
+- 更细粒度的 LibreNMS 调试信息
+
+也可以在这个版本基础上继续扩展。

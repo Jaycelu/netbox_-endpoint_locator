@@ -106,6 +106,14 @@ def lookup_device_vlans(device: Any) -> List[Dict[str, Any]]:
     return _records(_get(f"/api/v0/resources/vlans?hostname={quote(device_text, safe='')}"))
 
 
+def lookup_device_links(device: Any) -> List[Dict[str, Any]]:
+    return _records(_get(f"/api/v0/devices/{quote(str(device), safe='')}/links"))
+
+
+def lookup_device_port_stack(device: Any) -> List[Dict[str, Any]]:
+    return _records(_get(f"/api/v0/devices/{quote(str(device), safe='')}/port_stack"))
+
+
 def lookup_port_by_mac(mac: str) -> List[Dict[str, Any]]:
     return _records(_get(f"/api/v0/ports/mac/{mac}?filter=first"))
 

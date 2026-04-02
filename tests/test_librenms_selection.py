@@ -5,7 +5,7 @@ import types
 import unittest
 
 
-def load_librenms_module():
+def load_module(file_name, module_name):
     django_module = types.ModuleType("django")
     django_conf_module = types.ModuleType("django.conf")
     django_conf_module.settings = types.SimpleNamespace(PLUGINS_CONFIG={})
@@ -16,15 +16,16 @@ def load_librenms_module():
     sys.modules["django.conf"] = django_conf_module
     sys.modules.setdefault("requests", requests_module)
 
-    module_path = pathlib.Path(__file__).resolve().parents[1] / "netbox_endpoint_locator" / "librenms.py"
-    spec = importlib.util.spec_from_file_location("librenms_under_test", module_path)
+    module_path = pathlib.Path(__file__).resolve().parents[1] / "netbox_endpoint_locator" / file_name
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-librenms = load_librenms_module()
+librenms = load_module("librenms.py", "librenms_under_test")
+topology = load_module("topology.py", "topology_under_test")
 
 
 class LibreNMSSelectionTests(unittest.TestCase):
@@ -196,6 +197,102 @@ class LibreNMSSelectionTests(unittest.TestCase):
         picked = librenms.pick_scored_candidate(candidates)
 
         self.assertEqual(picked["port_id"], "202")
+
+
+class EdgeLocalizationTests(unittest.TestCase):
+    def test_pick_edge_candidate_prefers_downstream_leaf_port(self):
+        canonical = {
+            "candidate_id": "10:100",
+            "device_id": "10",
+            "port_id": "100",
+            "vlan": "514",
+            "interface": "Bridge-Aggregation203",
+            "description": "To_B2_1F_02C_11U_H3C-S5130",
+            "updated_at": "2026-04-02 10:00:00",
+        }
+        downstream = {
+            "candidate_id": "20:200",
+            "device_id": "20",
+            "port_id": "200",
+            "vlan": "514",
+            "interface": "Gi2/0/46",
+            "description": "GigabitEthernet2/0/46 Interface",
+            "updated_at": "2026-04-02 10:01:00",
+        }
+
+        selected = topology.pick_edge_candidate(
+            canonical,
+            [canonical, downstream],
+            links_by_device={
+                "10": [{"active": 1, "local_port_id": "101", "remote_device_id": "20"}],
+                "20": [],
+            },
+            stack_members_by_device={"10": {"100": {"101"}}, "20": {}},
+        )
+
+        self.assertEqual(selected["selected"]["candidate_id"], "20:200")
+        self.assertEqual(selected["path"], ["10:100", "20:200"])
+
+    def test_pick_edge_candidate_keeps_canonical_when_vlan_differs(self):
+        canonical = {
+            "candidate_id": "10:100",
+            "device_id": "10",
+            "port_id": "100",
+            "vlan": "514",
+            "interface": "Bridge-Aggregation203",
+            "description": "To_B2_1F_02C_11U_H3C-S5130",
+            "updated_at": "2026-04-02 10:00:00",
+        }
+        downstream_other_vlan = {
+            "candidate_id": "20:200",
+            "device_id": "20",
+            "port_id": "200",
+            "vlan": "997",
+            "interface": "Gi2/0/46",
+            "description": "GigabitEthernet2/0/46 Interface",
+            "updated_at": "2026-04-02 10:01:00",
+        }
+
+        selected = topology.pick_edge_candidate(
+            canonical,
+            [canonical, downstream_other_vlan],
+            links_by_device={
+                "10": [{"active": 1, "local_port_id": "101", "remote_device_id": "20"}],
+                "20": [],
+            },
+            stack_members_by_device={"10": {"100": {"101"}}, "20": {}},
+        )
+
+        self.assertEqual(selected["selected"]["candidate_id"], "10:100")
+
+    def test_pick_edge_candidate_keeps_canonical_without_downstream_path(self):
+        canonical = {
+            "candidate_id": "10:100",
+            "device_id": "10",
+            "port_id": "100",
+            "vlan": "514",
+            "interface": "Bridge-Aggregation203",
+            "description": "To_B2_1F_02C_11U_H3C-S5130",
+            "updated_at": "2026-04-02 10:00:00",
+        }
+        unrelated = {
+            "candidate_id": "30:300",
+            "device_id": "30",
+            "port_id": "300",
+            "vlan": "514",
+            "interface": "Gi1/0/24",
+            "description": "GigabitEthernet1/0/24 Interface",
+            "updated_at": "2026-04-02 10:01:00",
+        }
+
+        selected = topology.pick_edge_candidate(
+            canonical,
+            [canonical, unrelated],
+            links_by_device={"10": [], "30": []},
+            stack_members_by_device={"10": {}, "30": {}},
+        )
+
+        self.assertEqual(selected["selected"]["candidate_id"], "10:100")
 
 
 if __name__ == "__main__":
