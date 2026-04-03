@@ -5,7 +5,7 @@ class EndpointLocatorConfig(PluginConfig):
     name = "netbox_endpoint_locator"
     verbose_name = "Endpoint Locator"
     description = "Locate endpoint switch/port via LibreNMS APIs"
-    version = "0.4.1"
+    version = "1.0.0"
     author = "Jayce"
     author_email = "admin@example.com"
     base_url = "endpoint-locator"

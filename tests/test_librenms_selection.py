@@ -32,6 +32,9 @@ class LibreNMSSelectionTests(unittest.TestCase):
     def test_format_mac_readable_adds_colons(self):
         self.assertEqual(librenms.format_mac_readable("9ce89518ffd6"), "9c:e8:95:18:ff:d6")
 
+    def test_format_mac_ui_groups_mac_in_hyphenated_blocks(self):
+        self.assertEqual(librenms.format_mac_ui("000c29da9004"), "000c-29da-9004")
+
     def test_pick_arp_record_prefers_exact_ip_match(self):
         records = [
             {"ipv4_address": "172.22.1.2", "mac_address": "aa:bb:cc:dd:ee:ff"},

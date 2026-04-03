@@ -48,6 +48,11 @@ def format_mac_readable(value: str) -> str:
     return ":".join(normalized[index : index + 2] for index in range(0, 12, 2))
 
 
+def format_mac_ui(value: str) -> str:
+    normalized = normalize_mac(value)
+    return "-".join(normalized[index : index + 4] for index in range(0, 12, 4))
+
+
 def _get(path: str) -> Dict[str, Any]:
     cfg = _get_plugin_cfg()
     base_url = str(cfg["librenms_url"]).rstrip("/") + "/"

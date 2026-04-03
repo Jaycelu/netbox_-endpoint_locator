@@ -9,6 +9,7 @@ from .forms import EndpointLookupForm
 from .librenms import (
     collect_port_vlan_values,
     extract_vlan_from_interface_fields,
+    format_mac_ui,
     is_ip,
     normalize_mac,
     lookup_arp_by_mac,
@@ -526,8 +527,10 @@ class EndpointLookupView(View):
 
         return {
             "query": q,
+            "query_display": q if query_type == "ip" else format_mac_ui(mac),
             "query_type": query_type,
             "mac": mac,
+            "mac_display": format_mac_ui(mac),
             "ip": display_ip,
             "hostname": hostname,
             "device_name": device_name,
