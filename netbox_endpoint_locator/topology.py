@@ -18,6 +18,16 @@ def _normalized_id(value: Any) -> str:
     return str(value).strip()
 
 
+def _normalized_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+
+def _simplified_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _normalized_text(value))
+
+
 def candidate_id(candidate: Dict[str, Any]) -> str:
     return str(candidate.get("candidate_id") or f"{candidate.get('device_id', '')}:{candidate.get('port_id', '')}")
 
@@ -76,6 +86,66 @@ def classify_candidate(
     }
 
 
+def _candidate_identity_markers(candidate: Dict[str, Any]) -> Set[str]:
+    markers: Set[str] = set()
+
+    for value in (
+        candidate.get("device_key"),
+        candidate.get("hostname"),
+        candidate.get("device_name"),
+    ):
+        text = _normalized_text(value)
+        simplified = _simplified_text(value)
+        if len(text) >= 4:
+            markers.add(text)
+        if len(simplified) >= 8:
+            markers.add(simplified)
+
+    return markers
+
+
+def _candidate_reference_haystack(candidate: Dict[str, Any]) -> Set[str]:
+    values = {
+        _normalized_text(candidate.get("interface")),
+        _normalized_text(candidate.get("description")),
+        _simplified_text(candidate.get("interface")),
+        _simplified_text(candidate.get("description")),
+    }
+    return {value for value in values if value}
+
+
+def _description_points_to_candidate(
+    source: Dict[str, Any],
+    target: Dict[str, Any],
+    stack_members_by_device: Dict[str, Dict[str, Set[str]]],
+) -> bool:
+    if candidate_id(source) == candidate_id(target):
+        return False
+
+    source_device = _normalized_id(source.get("device_id"))
+    target_device = _normalized_id(target.get("device_id"))
+    if not source_device or not target_device or source_device == target_device:
+        return False
+
+    source_meta = classify_candidate(source, stack_members_by_device)
+    target_meta = classify_candidate(target, stack_members_by_device)
+    if not (source_meta["is_aggregate"] or source_meta["uplink_like"]):
+        return False
+    if source_meta["is_physical"] and not source_meta["is_aggregate"]:
+        return False
+    if target_meta["is_aggregate"] and not target_meta["is_physical"]:
+        return False
+
+    haystack = _candidate_reference_haystack(source)
+    markers = _candidate_identity_markers(target)
+    for marker in markers:
+        for text in haystack:
+            if marker in text:
+                return True
+
+    return False
+
+
 def build_candidate_graph(
     candidates: List[Dict[str, Any]],
     links_by_device: Dict[str, List[Dict[str, Any]]],
@@ -109,6 +179,12 @@ def build_candidate_graph(
                 continue
 
             for target in candidates_by_device.get(remote_device_id, []):
+                graph[source_id].add(candidate_id(target))
+
+    for source in candidates:
+        source_id = candidate_id(source)
+        for target in candidates:
+            if _description_points_to_candidate(source, target, stack_members_by_device):
                 graph[source_id].add(candidate_id(target))
 
     return graph

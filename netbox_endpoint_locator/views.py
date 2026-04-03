@@ -507,6 +507,7 @@ class EndpointLookupView(View):
                 "path": self._candidate_path_summary(topology.get("path", []), all_candidates),
                 "scores": topology.get("scores", {}),
                 "graph": topology.get("graph", {}),
+                "links_by_device": topology.get("links_by_device", {}),
                 "stack_members_by_device": topology.get("stack_members_by_device", {}),
             },
             "candidates": [self._candidate_summary(item) for item in all_candidates],

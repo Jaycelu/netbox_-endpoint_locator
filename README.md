@@ -2,7 +2,7 @@
 
 NetBox plugin for locating the access switch, interface, VLAN, and related IP/MAC information of an endpoint by querying LibreNMS.
 
-Current documented release: `0.4.0`
+Current documented release: `0.4.1`
 
 中文说明：[`README_CN.md`](./README_CN.md)
 
@@ -95,11 +95,11 @@ Or restart the relevant containers / Gunicorn / uWSGI processes in your environm
 
 Accepted MAC input styles include plain hex, colon-separated, dash-separated, and dotted formats.
 
-## How Correlation Works In 0.4.0
+## How Correlation Works In 0.4.1
 
 The plugin now prefers a canonical correlation path instead of mixing unrelated fields from multiple LibreNMS responses.
 
-Starting in `0.4.0`, the plugin keeps the canonical `IP / MAC / VLAN` relationship intact, then separately tries to localize the displayed switch and interface to the nearest access-side device instead of stopping at an upstream aggregation interface when topology evidence exists.
+Starting in `0.4.1`, the plugin keeps the canonical `IP / MAC / VLAN` relationship intact, then separately tries to localize the displayed switch and interface to the nearest access-side device instead of stopping at an upstream aggregation interface when topology evidence exists. When LLDP or port-stack data is missing, it can also infer a downstream edge from uplink descriptions that explicitly name the next-hop device.
 
 For IP lookups:
 
@@ -168,6 +168,6 @@ If no interface is found:
 
 ## Repository Notes
 
-- Package metadata version: `0.4.0`
+- Package metadata version: `0.4.1`
 - Plugin config class: [`netbox_endpoint_locator/__init__.py`](./netbox_endpoint_locator/__init__.py)
 - Detailed Chinese deployment and troubleshooting guide: [`README_CN.md`](./README_CN.md)

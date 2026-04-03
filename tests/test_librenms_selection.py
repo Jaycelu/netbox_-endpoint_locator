@@ -294,6 +294,43 @@ class EdgeLocalizationTests(unittest.TestCase):
 
         self.assertEqual(selected["selected"]["candidate_id"], "10:100")
 
+    def test_pick_edge_candidate_infers_downstream_from_uplink_description(self):
+        canonical = {
+            "candidate_id": "13:2024",
+            "device_id": "13",
+            "device_key": "172.22.38.13",
+            "hostname": "172.22.38.13",
+            "device_name": "smzy_b1_lan_6520",
+            "port_id": "2024",
+            "vlan": "523",
+            "interface": "Bridge-Aggregation204",
+            "description": "To_BGW-B7-03_172.22.254.7",
+            "updated_at": "2026-04-02T10:37:25.000000Z",
+        }
+        downstream = {
+            "candidate_id": "12:1639",
+            "device_id": "12",
+            "device_key": "172.22.254.7",
+            "hostname": "172.22.254.7",
+            "device_name": "b2_4f_03c_26u_h3c-s5130",
+            "port_id": "1639",
+            "vlan": "523",
+            "interface": "GigabitEthernet1/0/3",
+            "description": "GigabitEthernet1/0/3 Interface",
+            "updated_at": "2026-04-02T04:36:33.000000Z",
+        }
+
+        selected = topology.pick_edge_candidate(
+            canonical,
+            [canonical, downstream],
+            links_by_device={"12": [], "13": []},
+            stack_members_by_device={"12": {}, "13": {}},
+        )
+
+        self.assertEqual(selected["graph"]["13:2024"], {"12:1639"})
+        self.assertEqual(selected["selected"]["candidate_id"], "12:1639")
+        self.assertEqual(selected["path"], ["13:2024", "12:1639"])
+
 
 if __name__ == "__main__":
     unittest.main()
