@@ -309,6 +309,7 @@ class EndpointLookupView(View):
 
         return {
             "candidate_id": candidate_token,
+            "source": "fdb",
             "score": score,
             "updated_at": str(fdb_record.get("updated_at") or ""),
             "device_id": device_id,
@@ -327,12 +328,109 @@ class EndpointLookupView(View):
         }
 
     @staticmethod
+    def _is_not_found_error(exc):
+        response = getattr(exc, "response", None)
+        if getattr(response, "status_code", None) == 404:
+            return True
+
+        message = str(exc)
+        return "404" in message and "Not Found" in message
+
+    def _build_arp_direct_candidate(self, arp_record):
+        if not isinstance(arp_record, dict):
+            return None
+
+        port_id = str(arp_record.get("port_id") or "").strip()
+        if not port_id:
+            return None
+
+        port_info = self._get_port(port_id)
+        device_key = self._get_device_lookup_key(port_info, arp_record)
+        hostname, device_name = self._device_names(port_info, arp_record)
+        interface = str(
+            (port_info or {}).get("ifName")
+            or (port_info or {}).get("ifDescr")
+            or (port_info or {}).get("ifAlias")
+            or arp_record.get("ifName")
+            or arp_record.get("ifDescr")
+            or arp_record.get("ifAlias")
+            or arp_record.get("port")
+            or ""
+        ).strip()
+        description = str(
+            (port_info or {}).get("ifAlias")
+            or (port_info or {}).get("ifDescr")
+            or arp_record.get("description")
+            or ""
+        ).strip()
+        device_id = str(
+            arp_record.get("device_id")
+            or (port_info or {}).get("device_id")
+            or (((port_info or {}).get("device") or {}).get("device_id") if isinstance((port_info or {}).get("device"), dict) else "")
+            or ""
+        ).strip()
+        vlan = extract_vlan_from_interface_fields(arp_record)
+        if not vlan:
+            vlan = extract_vlan_from_interface_fields(port_info)
+
+        port_vlans = collect_port_vlan_values(port_info)
+        if not vlan and len(port_vlans) == 1:
+            vlan = port_vlans[0]
+
+        candidate_token = f"{device_id}:{port_id}" if device_id and port_id else port_id
+
+        return {
+            "candidate_id": candidate_token,
+            "source": "arp_direct",
+            "score": None,
+            "updated_at": "",
+            "device_id": device_id,
+            "device_key": str(device_key or device_id or "").strip(),
+            "hostname": hostname,
+            "device_name": device_name,
+            "interface": interface,
+            "description": description,
+            "port_id": port_id,
+            "vlan": vlan,
+            "fdb": {},
+            "port": port_info,
+            "detail": {},
+            "related_ip": parse_ip_from_arp(arp_record),
+            "arp_records": [arp_record],
+        }
+
+    def _build_direct_arp_localization(self, arp_records):
+        arp_record = pick_arp_record(list(arp_records or []))
+        direct_candidate = self._build_arp_direct_candidate(arp_record)
+        if not direct_candidate:
+            return None
+
+        direct_candidate_id = candidate_id(direct_candidate)
+        path = [direct_candidate_id] if direct_candidate_id else []
+
+        return {
+            "canonical": direct_candidate,
+            "edge": direct_candidate,
+            "candidates": [direct_candidate],
+            "topology": {
+                "selected": direct_candidate,
+                "graph": {},
+                "path": path,
+                "scores": {},
+                "candidates": [direct_candidate],
+                "links_by_device": {},
+                "stack_members_by_device": {},
+            },
+        }
+
+    @staticmethod
     def _candidate_summary(candidate):
         if not isinstance(candidate, dict):
             return {}
 
         return {
             "candidate_id": str(candidate.get("candidate_id") or ""),
+            "source": str(candidate.get("source") or ""),
             "device_id": str(candidate.get("device_id") or ""),
             "device_key": str(candidate.get("device_key") or ""),
             "hostname": str(candidate.get("hostname") or ""),
@@ -409,11 +507,29 @@ class EndpointLookupView(View):
         ]
 
     def locate_by_mac(self, mac, arp_records=None):
-        arp_context = self._collect_arp_context(arp_records or [])
-        fdb_records = lookup_fdb_by_mac(mac)
-        fdb_detail_records = lookup_fdb_detail_by_mac(mac)
+        arp_records = list(arp_records or [])
+        arp_context = self._collect_arp_context(arp_records)
+        direct_localization = self._build_direct_arp_localization(arp_records)
+
+        try:
+            fdb_records = lookup_fdb_by_mac(mac)
+        except Exception as exc:
+            if direct_localization and self._is_not_found_error(exc):
+                return direct_localization
+            raise
+
+        try:
+            fdb_detail_records = lookup_fdb_detail_by_mac(mac)
+        except Exception as exc:
+            if self._is_not_found_error(exc):
+                fdb_detail_records = []
+            else:
+                raise
+
         candidates = [self._build_fdb_candidate(item, arp_context, fdb_detail_records) for item in fdb_records]
         canonical_candidate = pick_scored_candidate(candidates)
+        if not canonical_candidate and direct_localization:
+            return direct_localization
         topology = self._build_topology_context(canonical_candidate, candidates)
 
         return {

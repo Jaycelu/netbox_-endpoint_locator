@@ -2,7 +2,7 @@
 
 NetBox plugin for locating the access switch, interface, VLAN, and related IP/MAC information of an endpoint by querying LibreNMS.
 
-Current documented release: `1.0.0`
+Current documented release: `1.0.1`
 
 中文说明：[`README_CN.md`](./README_CN.md)
 
@@ -168,6 +168,6 @@ If no interface is found:
 
 ## Repository Notes
 
-- Package metadata version: `1.0.0`
+- Package metadata version: `1.0.1`
 - Plugin config class: [`netbox_endpoint_locator/__init__.py`](./netbox_endpoint_locator/__init__.py)
 - Detailed Chinese deployment and troubleshooting guide: [`README_CN.md`](./README_CN.md)
