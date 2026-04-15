@@ -1,4 +1,5 @@
 import json
+import re
 
 from django.shortcuts import render
 from django.views.generic import View
@@ -8,6 +9,7 @@ from ipam.models import IPAddress
 from .forms import EndpointLookupForm
 from .librenms import (
     collect_port_vlan_values,
+    extract_untagged_port_vlan,
     extract_vlan_from_interface_fields,
     format_mac_ui,
     is_ip,
@@ -27,11 +29,13 @@ from .librenms import (
     resolve_fdb_vlan,
     score_fdb_candidate,
 )
-from .topology import build_port_stack_members, candidate_id, pick_edge_candidate
+from .topology import build_port_stack_members, candidate_id, classify_candidate, pick_edge_candidate
 
 
 class EndpointLookupView(View):
     template_name = "netbox_endpoint_locator/lookup.html"
+    ROUTED_INTERFACE_RE = re.compile(r"(?i)(^vlan[-\s_]*interface\d+$|^vlan[-\s_]*\d+$|^irb[\d.]*$|^bdi\d+$|^loopback\d+$|^lo\d+$)")
+    TRUNK_MODE_RE = re.compile(r"(?i)(trunk|tagged|hybrid)")
 
     def get_netbox_device_by_mgmt_ip(self, hostname: str):
         """
@@ -109,7 +113,13 @@ class EndpointLookupView(View):
             return []
 
         if cache_token not in self._device_link_cache:
-            self._device_link_cache[cache_token] = lookup_device_links(lookup_key)
+            try:
+                self._device_link_cache[cache_token] = lookup_device_links(lookup_key)
+            except Exception as exc:
+                if self._is_not_found_error(exc):
+                    self._device_link_cache[cache_token] = []
+                else:
+                    raise
 
         return self._device_link_cache[cache_token]
 
@@ -120,7 +130,13 @@ class EndpointLookupView(View):
             return []
 
         if cache_token not in self._device_port_stack_cache:
-            self._device_port_stack_cache[cache_token] = lookup_device_port_stack(lookup_key)
+            try:
+                self._device_port_stack_cache[cache_token] = lookup_device_port_stack(lookup_key)
+            except Exception as exc:
+                if self._is_not_found_error(exc):
+                    self._device_port_stack_cache[cache_token] = []
+                else:
+                    raise
 
         return self._device_port_stack_cache[cache_token]
 
@@ -137,6 +153,97 @@ class EndpointLookupView(View):
                     names.add(str(value).strip().lower())
 
         return names
+
+    @classmethod
+    def _is_routed_interface_like(cls, *values):
+        for value in values:
+            text = str(value or "").strip()
+            if text and cls.ROUTED_INTERFACE_RE.search(text):
+                return True
+        return False
+
+    def _arp_record_is_routed(self, arp_record, port_info):
+        values = []
+
+        for record in (arp_record, port_info):
+            if not isinstance(record, dict):
+                continue
+            for key in ("ifName", "ifDescr", "ifAlias", "port", "port_label", "portName"):
+                values.append(record.get(key))
+
+        return self._is_routed_interface_like(*values)
+
+    def _candidate_selection_meta(self, candidate):
+        meta = classify_candidate(candidate, {})
+        port_info = candidate.get("port") or {}
+        port_vlans = collect_port_vlan_values(port_info)
+        untagged_vlan = extract_untagged_port_vlan(port_info)
+        candidate_vlan = str(candidate.get("vlan") or "").strip()
+
+        mode_values = []
+        if isinstance(port_info, dict):
+            for key in ("mode", "ifMode", "port_mode", "ifType"):
+                value = port_info.get(key)
+                if value:
+                    mode_values.append(str(value))
+
+        trunk_mode = any(self.TRUNK_MODE_RE.search(value) for value in mode_values)
+        trunk_by_vlans = len(port_vlans) >= 4 or (len(port_vlans) >= 2 and not untagged_vlan)
+        vlan_mismatch = bool(candidate_vlan and untagged_vlan and candidate_vlan != untagged_vlan)
+        interface = str(candidate.get("interface") or "").strip()
+        description = str(candidate.get("description") or "").strip()
+        routed_like = self._is_routed_interface_like(
+            interface,
+            description,
+            (port_info or {}).get("ifName"),
+            (port_info or {}).get("ifDescr"),
+            (port_info or {}).get("ifAlias"),
+        )
+
+        uplink_or_trunk_like = bool(
+            meta["is_aggregate"]
+            or routed_like
+            or meta["uplink_like"]
+            or trunk_mode
+            or trunk_by_vlans
+            or vlan_mismatch
+        )
+
+        return {
+            "is_aggregate": bool(meta["is_aggregate"]),
+            "is_physical": bool(meta["is_physical"]),
+            "uplink_like": bool(meta["uplink_like"]),
+            "routed_like": routed_like,
+            "trunk_mode": trunk_mode,
+            "trunk_by_vlans": trunk_by_vlans,
+            "vlan_mismatch": vlan_mismatch,
+            "uplink_or_trunk_like": uplink_or_trunk_like,
+            "port_vlans": port_vlans,
+            "untagged_vlan": untagged_vlan,
+        }
+
+    def _filter_terminal_candidates(self, candidates):
+        annotated = []
+        for item in candidates or []:
+            item["selection"] = self._candidate_selection_meta(item)
+            annotated.append(item)
+
+        if len(annotated) <= 1:
+            return annotated
+
+        pool = list(annotated)
+
+        def prefer(predicate):
+            nonlocal pool
+            preferred = [item for item in pool if predicate(item)]
+            if preferred:
+                pool = preferred
+
+        prefer(lambda item: not item["selection"]["is_aggregate"] and not item["selection"]["routed_like"])
+        prefer(lambda item: not item["selection"]["uplink_or_trunk_like"])
+        prefer(lambda item: item["selection"]["is_physical"])
+
+        return pool
 
     def _pick_matching_detail_record(self, records, fdb_record, port_info):
         if not records:
@@ -204,15 +311,16 @@ class EndpointLookupView(View):
             port_id = arp_record.get("port_id")
             port_info = self._get_port(port_id) if port_id else None
             record_ip = parse_ip_from_arp(arp_record)
+            routed_record = self._arp_record_is_routed(arp_record, port_info)
 
-            if port_id:
+            if port_id and not routed_record:
                 port_id_text = str(port_id).strip()
                 context["port_ids"].add(port_id_text)
                 if record_ip and port_id_text not in context["ip_by_port_id"]:
                     context["ip_by_port_id"][port_id_text] = record_ip
 
             device_id = arp_record.get("device_id") or (port_info or {}).get("device_id")
-            if device_id:
+            if device_id and not routed_record:
                 context["device_ids"].add(str(device_id).strip())
 
             vlan_hint = extract_vlan_from_interface_fields(arp_record)
@@ -442,6 +550,7 @@ class EndpointLookupView(View):
             "related_ip": str(candidate.get("related_ip") or ""),
             "score": candidate.get("score"),
             "updated_at": str(candidate.get("updated_at") or ""),
+            "selection": dict(candidate.get("selection") or {}),
         }
 
     def _build_topology_context(self, canonical_candidate, candidates):
@@ -461,15 +570,14 @@ class EndpointLookupView(View):
 
         for candidate in candidates:
             device_id = str(candidate.get("device_id") or "").strip()
-            device_key = str(candidate.get("device_key") or device_id).strip()
-            if not device_id or not device_key:
+            if not device_id:
                 continue
 
             if device_id not in links_by_device:
-                links_by_device[device_id] = self._get_device_links_cached(device_key, cache_key=device_id)
+                links_by_device[device_id] = self._get_device_links_cached(device_id, cache_key=device_id)
 
             if device_id not in stack_members_by_device:
-                stack_records = self._get_device_port_stack_cached(device_key, cache_key=device_id)
+                stack_records = self._get_device_port_stack_cached(device_id, cache_key=device_id)
                 stack_members_by_device[device_id] = build_port_stack_members(stack_records)
 
         selection = pick_edge_candidate(
@@ -527,15 +635,17 @@ class EndpointLookupView(View):
                 raise
 
         candidates = [self._build_fdb_candidate(item, arp_context, fdb_detail_records) for item in fdb_records]
-        canonical_candidate = pick_scored_candidate(candidates)
+        eligible_candidates = self._filter_terminal_candidates(candidates)
+        canonical_candidate = pick_scored_candidate(eligible_candidates or candidates)
         if not canonical_candidate and direct_localization:
             return direct_localization
-        topology = self._build_topology_context(canonical_candidate, candidates)
+        topology = self._build_topology_context(canonical_candidate, eligible_candidates or candidates)
 
         return {
             "canonical": canonical_candidate,
             "edge": topology.get("selected") or canonical_candidate,
             "candidates": candidates,
+            "eligible_candidates": eligible_candidates,
             "topology": topology,
         }
 
@@ -583,6 +693,7 @@ class EndpointLookupView(View):
         display_candidate = (localization or {}).get("edge") or canonical_candidate
         topology = (localization or {}).get("topology") or {}
         all_candidates = (localization or {}).get("candidates") or []
+        eligible_candidates = (localization or {}).get("eligible_candidates") or all_candidates
 
         canonical_port = canonical_candidate.get("port") or {}
         canonical_fdb = canonical_candidate.get("fdb") or {}
@@ -628,6 +739,7 @@ class EndpointLookupView(View):
                 "stack_members_by_device": topology.get("stack_members_by_device", {}),
             },
             "candidates": [self._candidate_summary(item) for item in all_candidates],
+            "eligible_candidates": [self._candidate_summary(item) for item in eligible_candidates],
             "canonical_evidence": {
                 "fdb": canonical_fdb,
                 "port": canonical_port,

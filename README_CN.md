@@ -2,7 +2,7 @@
 
 这是一个基于 LibreNMS API 的 NetBox 插件，用来按 `IP` 或 `MAC` 查询终端所在的交换机、接口、VLAN，以及关联的 IPv4 信息。
 
-当前文档对应版本：`1.0.1`
+当前文档对应版本：`1.0.2`
 
 英文首页入口：[`README.md`](./README.md)
 
@@ -12,6 +12,7 @@
 
 - 支持输入 `IPv4` 或 `MAC`
 - 查询结果尽量与 LibreNMS Web 前端保持一致
+- 在最终选口前自动排除聚合口、三层口和 trunk/互联口，尽量命中真实终端接入口
 - 显示：
   - MAC
   - 关联 IPv4
@@ -160,10 +161,14 @@ sudo systemctl restart netbox netbox-rq
    - `mac_address`
    - `port_id`
 3. 再按 MAC 查 `FDB`
-4. 用 ARP 的 `port_id / device / 接口线索 / VLAN 线索` 给 FDB 候选打分
-5. 选中最可信的一条 FDB 记录
-6. 再按这条 FDB 的 `port_id` 读取端口详情和设备关系
-7. 最后解析真实 VLAN 并展示
+4. 如果 ARP 命中的是 `Vlan-interface` 之类的三层接口，只把它当成 `MAC / VLAN` 线索，不再拿它强行拉高同设备的 FDB 候选
+5. 先对 FDB 候选过滤上、下联接口：
+   - 聚合口，如 `Bridge-Aggregation` / `Port-Channel`
+   - 明显的 trunk / uplink / interconnect 描述
+   - 带 trunk/hybrid/tagged 模式或多 VLAN 成员的物理互联口
+6. 在剩余候选里选最可信的一条 FDB 记录
+7. 再按这条 FDB 的 `port_id` 读取端口详情和设备关系
+8. 最后解析真实 VLAN 并展示
 
 ### 7.3 输入 MAC 时
 
@@ -175,8 +180,8 @@ sudo systemctl restart netbox netbox-rq
 
 1. 先按 MAC 查 `ARP`
 2. 再按 MAC 查 `FDB`
-3. 用 ARP 返回的端口/设备/IP 作为上下文
-4. 对 FDB 候选排序
+3. 用 ARP 返回的 `MAC / VLAN / IP` 作为上下文；如果 ARP 接口本身是 `Vlan-interface`，则不再把它当作终端口提示
+4. 先过滤 trunk / uplink / 聚合候选，再对剩余 FDB 候选排序
 5. 再补端口详情和设备名
 
 这就是为什么现在 `MAC 反查 IP`、`IP 反查 MAC`、`VLAN`、`接口` 能更一致。

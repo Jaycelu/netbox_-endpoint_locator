@@ -75,6 +75,14 @@ def load_views_module():
         for item in (port_info or {}).get("vlans") or []
         if isinstance(item, dict) and item.get("vlan") is not None
     ]
+    librenms_module.extract_untagged_port_vlan = lambda port_info: next(
+        (
+            str(item.get("vlan"))
+            for item in (port_info or {}).get("vlans") or []
+            if isinstance(item, dict) and str(item.get("untagged") or "").strip() in {"1", "true", "True"}
+        ),
+        "",
+    )
     librenms_module.extract_vlan_from_interface_fields = lambda record: ""
     librenms_module.format_mac_ui = lambda mac: mac
     librenms_module.is_ip = lambda value: True
@@ -112,6 +120,15 @@ def load_views_module():
 
     topology_module = types.ModuleType(f"{package_name}.topology")
     topology_module.build_port_stack_members = lambda mappings: {}
+    topology_module.classify_candidate = lambda candidate, stack_members_by_device: {
+        "is_aggregate": "bridge-aggregation" in str(candidate.get("interface") or "").lower(),
+        "is_physical": any(
+            token in str(candidate.get("interface") or "").lower()
+            for token in ("gigabitethernet", "xge", "ge", "gi")
+        ),
+        "uplink_like": "to_" in str(candidate.get("description") or "").lower() or "uplink" in str(candidate.get("description") or "").lower(),
+        "stack_members": [],
+    }
     topology_module.candidate_id = lambda candidate: str(
         candidate.get("candidate_id") or f"{candidate.get('device_id', '')}:{candidate.get('port_id', '')}"
     )
@@ -211,6 +228,156 @@ class EndpointLookupArpFallbackTests(unittest.TestCase):
                 "00900b6951a6",
                 arp_records=[{"ipv4_address": "172.25.254.251", "mac_address": "00:90:0b:69:51:a6"}],
             )
+
+    def test_locate_by_mac_prefers_access_port_over_uplink_candidate(self):
+        port_map = {
+            "10": {
+                "port_id": "10",
+                "device_id": "112",
+                "ifName": "Bridge-Aggregation1",
+                "ifAlias": "To_B1_Access_01",
+                "device": {
+                    "device_id": "112",
+                    "hostname": "192.168.100.112",
+                    "sysName": "B1-AGG-01",
+                },
+                "vlans": [{"vlan": "102"}, {"vlan": "103"}, {"vlan": "104"}, {"vlan": "105"}],
+            },
+            "20": {
+                "port_id": "20",
+                "device_id": "220",
+                "ifName": "GigabitEthernet1/0/3",
+                "ifAlias": "Office-PC-01",
+                "device": {
+                    "device_id": "220",
+                    "hostname": "192.168.100.220",
+                    "sysName": "B1-ACCESS-01",
+                },
+                "vlans": [{"vlan": "102", "untagged": 1}],
+            },
+            "900": {
+                "port_id": "900",
+                "device_id": "1",
+                "ifName": "Vlan-interface102",
+                "ifAlias": "Gateway SVI",
+                "device": {
+                    "device_id": "1",
+                    "hostname": "192.168.100.1",
+                    "sysName": "B1-GW-01",
+                },
+                "vlans": [],
+            },
+        }
+
+        self.views.lookup_port_by_id = lambda port_id, with_relations=None: dict(port_map[str(port_id)])
+        self.views.lookup_fdb_by_mac = lambda mac: [
+            {"device_id": "112", "port_id": "10", "vlan": "102", "updated_at": "2026-04-15 10:00:00"},
+            {"device_id": "220", "port_id": "20", "vlan": "102", "updated_at": "2026-04-15 09:59:00"},
+        ]
+        self.views.lookup_fdb_detail_by_mac = lambda mac: []
+        self.views.lookup_device_vlans = lambda device: []
+        localization = self.view.locate_by_mac(
+            "0090e86a00a1",
+            arp_records=[
+                {
+                    "device_id": "1",
+                    "port_id": "900",
+                    "ipv4_address": "192.168.102.74",
+                    "mac_address": "00:90:e8:6a:00:a1",
+                    "ifName": "Vlan-interface102",
+                }
+            ],
+        )
+
+        self.assertEqual(localization["canonical"]["device_id"], "220")
+        self.assertEqual(localization["canonical"]["port_id"], "20")
+        self.assertEqual(localization["canonical"]["interface"], "GigabitEthernet1/0/3")
+        self.assertEqual(localization["eligible_candidates"][0]["candidate_id"], "220:20")
+
+    def test_locate_by_mac_prefers_access_port_over_physical_trunk_uplink(self):
+        port_map = {
+            "11": {
+                "port_id": "11",
+                "device_id": "112",
+                "ifName": "GigabitEthernet1/0/48",
+                "ifAlias": "Uplink_to_B1_AGG_01",
+                "device": {
+                    "device_id": "112",
+                    "hostname": "192.168.100.112",
+                    "sysName": "B1-SW-TRUNK",
+                },
+                "vlans": [{"vlan": "102"}, {"vlan": "103"}, {"vlan": "104"}, {"vlan": "105"}],
+                "ifMode": "trunk",
+            },
+            "21": {
+                "port_id": "21",
+                "device_id": "220",
+                "ifName": "GigabitEthernet1/0/5",
+                "ifAlias": "Desk-05",
+                "device": {
+                    "device_id": "220",
+                    "hostname": "192.168.100.220",
+                    "sysName": "B1-ACCESS-05",
+                },
+                "vlans": [{"vlan": "102", "untagged": 1}],
+                "ifMode": "access",
+            },
+        }
+
+        self.views.lookup_port_by_id = lambda port_id, with_relations=None: dict(port_map[str(port_id)])
+        self.views.lookup_fdb_by_mac = lambda mac: [
+            {"device_id": "112", "port_id": "11", "vlan": "102", "updated_at": "2026-04-15 10:00:00"},
+            {"device_id": "220", "port_id": "21", "vlan": "102", "updated_at": "2026-04-15 09:59:00"},
+        ]
+        self.views.lookup_fdb_detail_by_mac = lambda mac: []
+        self.views.lookup_device_vlans = lambda device: []
+
+        localization = self.view.locate_by_mac("0090e86a00a1", arp_records=[])
+
+        self.assertEqual(localization["canonical"]["device_id"], "220")
+        self.assertEqual(localization["canonical"]["port_id"], "21")
+        self.assertEqual(localization["eligible_candidates"][0]["candidate_id"], "220:21")
+
+    def test_locate_by_mac_ignores_device_links_404_and_uses_device_id_lookup(self):
+        self.views.lookup_port_by_id = lambda port_id, with_relations=None: {
+            "port_id": str(port_id),
+            "device_id": "112",
+            "ifName": "GigabitEthernet1/0/8",
+            "ifAlias": "Office-PC-08",
+            "device": {
+                "device_id": "112",
+                "hostname": "192.168.100.112",
+                "sysName": "B1-ACCESS-08",
+            },
+            "vlans": [{"vlan": "102", "untagged": 1}],
+        }
+        self.views.lookup_fdb_by_mac = lambda mac: [
+            {"device_id": "112", "port_id": "88", "vlan": "102", "updated_at": "2026-04-15 10:00:00"}
+        ]
+        self.views.lookup_fdb_detail_by_mac = lambda mac: []
+        self.views.lookup_device_vlans = lambda device: []
+
+        seen_links = []
+        seen_stack = []
+
+        def fake_links(device):
+            seen_links.append(device)
+            raise ResponseNotFoundError(f"404 Client Error: Not Found for url: http://localhost:8081/api/v0/devices/{device}/links")
+
+        def fake_stack(device):
+            seen_stack.append(device)
+            raise ResponseNotFoundError(f"404 Client Error: Not Found for url: http://localhost:8081/api/v0/devices/{device}/port_stack")
+
+        self.views.lookup_device_links = fake_links
+        self.views.lookup_device_port_stack = fake_stack
+
+        localization = self.view.locate_by_mac("0090e86a00a1", arp_records=[])
+
+        self.assertEqual(localization["canonical"]["device_id"], "112")
+        self.assertEqual(seen_links, ["112"])
+        self.assertEqual(seen_stack, ["112"])
+        self.assertEqual(localization["topology"]["links_by_device"], {"112": []})
+        self.assertEqual(localization["topology"]["stack_members_by_device"], {"112": {}})
 
 
 if __name__ == "__main__":

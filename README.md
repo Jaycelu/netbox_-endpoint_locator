@@ -2,7 +2,7 @@
 
 NetBox plugin for locating the access switch, interface, VLAN, and related IP/MAC information of an endpoint by querying LibreNMS.
 
-Current documented release: `1.0.1`
+Current documented release: `1.0.2`
 
 中文说明：[`README_CN.md`](./README_CN.md)
 
@@ -11,6 +11,7 @@ Current documented release: `1.0.1`
 - Lookup by `IPv4` or `MAC`
 - Correlate `IP / MAC / VLAN / port` from the same LibreNMS record chain as closely as possible
 - Show switch/device name, interface, terminal VLAN, and related IPv4
+- Automatically filter aggregation, routed, and trunk-like interconnect ports before choosing the terminal-facing interface
 - Optionally map the LibreNMS management address back to a NetBox `Device`
 - Expose raw API data in the UI for troubleshooting
 
@@ -106,18 +107,23 @@ For IP lookups:
 1. Query ARP by IP
 2. Extract MAC and ARP `port_id`
 3. Query FDB by MAC
-4. Score FDB candidates using ARP `port_id`, device, interface, and VLAN hints
-5. Read the winning port details for:
+4. If ARP lands on a routed interface such as `Vlan-interface102`, use it only as `MAC / VLAN` context instead of promoting that device as the endpoint port
+5. Filter FDB candidates before final scoring:
+   - aggregate ports such as `Bridge-Aggregation` / `Port-Channel`
+   - obvious trunk / uplink / interconnect descriptions
+   - physical interconnect ports that expose trunk/hybrid/tagged mode or multiple VLAN memberships
+6. Read the winning port details for:
    - device relation
    - VLAN relation
-6. Resolve the display VLAN from LibreNMS VLAN resources
+7. Resolve the display VLAN from LibreNMS VLAN resources
 
 For MAC lookups:
 
 1. Query ARP by MAC
 2. Query FDB by MAC
-3. Score candidates with ARP/device/interface hints
-4. Enrich the selected FDB row with port and device details
+3. Use ARP as `MAC / VLAN / IP` context; if the ARP interface itself is routed, do not treat it as a terminal-port hint
+4. Filter trunk / uplink / aggregate candidates before final scoring
+5. Enrich the selected FDB row with port and device details
 
 This is what fixes the earlier mismatch where `IP -> MAC` looked correct but `MAC -> IP/VLAN/port` drifted to another interface.
 
@@ -168,6 +174,6 @@ If no interface is found:
 
 ## Repository Notes
 
-- Package metadata version: `1.0.1`
+- Package metadata version: `1.0.2`
 - Plugin config class: [`netbox_endpoint_locator/__init__.py`](./netbox_endpoint_locator/__init__.py)
 - Detailed Chinese deployment and troubleshooting guide: [`README_CN.md`](./README_CN.md)

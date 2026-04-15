@@ -25,8 +25,6 @@ def _get_plugin_cfg() -> Dict[str, Any]:
             f"{', '.join(missing)}。请在 NetBox 的 PLUGINS_CONFIG['{PLUGIN_SLUG}'] 中设置。"
         )
     return cfg
-
-
 def is_ip(value: str) -> bool:
     try:
         ipaddress.ip_address(value)
@@ -323,7 +321,7 @@ def collect_port_vlan_values(port_info: Optional[Dict[str, Any]]) -> List[str]:
     return values
 
 
-def _extract_untagged_port_vlan(port_info: Optional[Dict[str, Any]]) -> str:
+def extract_untagged_port_vlan(port_info: Optional[Dict[str, Any]]) -> str:
     if not isinstance(port_info, dict):
         return ""
 
@@ -425,7 +423,7 @@ def resolve_fdb_vlan(
     if vlan_row_id:
         return ""
 
-    untagged_vlan = _extract_untagged_port_vlan(port_info)
+    untagged_vlan = extract_untagged_port_vlan(port_info)
     if untagged_vlan:
         return untagged_vlan
 
